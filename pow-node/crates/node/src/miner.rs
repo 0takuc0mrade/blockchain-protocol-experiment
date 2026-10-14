@@ -19,10 +19,10 @@ use std::{
 use alloy::primitives::Bytes;
 use primitives::{
     constants::{BLOCK_GAS_LIMIT, EXTRA_DATA},
-    node::{Block, BlockHeader, retarget_difficulty},
+    node::{Block, retarget_difficulty},
 };
 
-use crate::{chain::Chain, executor::execute_block, pow};
+use crate::{chain::Chain, evm::BreejaDb, executor::execute_block, pow};
 
 /// Starts the miner on its own OS thread.
 ///
@@ -51,10 +51,11 @@ fn run(chain: Chain) {
     while !chain.is_shutting_down() {
         // snapshot the chain, holding the read lock only briefly
         let generation = chain.mempool_generation();
-        let (accounts, parent, batch) = {
+        let (accounts, block_hashes, parent, batch) = {
             let state = chain.read();
             (
                 state.accounts_snapshot(),
+                state.block_hashes_snapshot(),
                 state.head().clone(),
                 state.peek_mempool_batch(),
             )
@@ -62,26 +63,32 @@ fn run(chain: Chain) {
 
         let number = parent.number + 1;
 
-        // execute the candidate block, with no lock held
-        let execution = execute_block(accounts, &batch, number, config.miner);
-
-        let mut header = BlockHeader {
+        // Fix the EVM-visible fields before execution so the mined header uses
+        // the same number, timestamp, miner, gas limit, and parent hash.
+        let mut block = Block {
             number,
             parent_hash: parent.hash,
-            state_root: execution.state_root,
-            transaction_root: execution.transaction_root,
-            receipts_root: execution.receipts_root,
             difficulty,
+            total_difficulty: parent.total_difficulty + difficulty as u64,
             // A block's timestamp must advance, even if the system clock does not.
             timestamp: unix_now().max(parent.timestamp + 1),
             gas_limit: BLOCK_GAS_LIMIT,
-            gas_used: execution.gas_used,
             miner: config.miner,
             extra_data: Bytes::from_static(EXTRA_DATA.as_bytes()),
-            nonce: 0,
+            ..Default::default()
         };
 
-        // the proof of work, also with no lock held 
+        // Build the REVM database and execute with no chain lock held.
+        let db = BreejaDb::new(accounts, block_hashes);
+        let execution = execute_block(db, &batch, &block);
+        block.state_root = execution.state_root;
+        block.transaction_root = execution.transaction_root;
+        block.receipts_root = execution.receipts_root;
+        block.gas_used = execution.gas_used;
+        block.transactions = execution.transactions.iter().map(|tx| tx.hash).collect();
+        let mut header = block.header();
+
+        // the proof of work, also with no lock held
         //
         // The search is abandoned if the node is shutting down, or if a new
         // transaction arrives: there is no point spending another ten seconds on a
@@ -98,30 +105,14 @@ fn run(chain: Chain) {
             );
             continue;
         };
-        header.nonce = seal.nonce;
-
-        let mut block = Block {
-            number,
-            parent_hash: header.parent_hash,
-            state_root: header.state_root,
-            transaction_root: header.transaction_root,
-            receipts_root: header.receipts_root,
-            difficulty,
-            total_difficulty: parent.total_difficulty + difficulty as u64,
-            timestamp: header.timestamp,
-            gas_limit: header.gas_limit,
-            gas_used: header.gas_used,
-            miner: header.miner,
-            extra_data: header.extra_data.clone(),
-            nonce: seal.nonce,
-            hash: seal.hash,
-            transactions: execution.transactions.iter().map(|tx| tx.hash).collect(),
-        };
+        block.nonce = seal.nonce;
+        block.hash = seal.hash;
 
         // A block's own hash cannot be known until it is sealed, so the
         // transactions and receipts learn which block they are in only now.
         let mut transactions = execution.transactions;
         let mut receipts = execution.receipts;
+        let block_tx_count = transactions.len();
         for tx in &mut transactions {
             tx.block_hash = block.hash;
         }
@@ -145,7 +136,7 @@ fn run(chain: Chain) {
         tracing::info!(
             number,
             hash = %seal.hash,
-            txs = batch.len(),
+            txs = block_tx_count,
             difficulty,
             nonce = seal.nonce,
             attempts = seal.attempts,

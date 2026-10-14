@@ -38,7 +38,7 @@ pub fn sign_transfer_with(
 ) -> Result<Bytes, anyhow::Error> {
     let signer: PrivateKeySigner = private_key.parse()?;
 
-    // 1. The unsigned transaction. `input` is empty because this node has no EVM.
+    // 1. Empty calldata keeps this helper specific to plain ETH transfers.
     let tx = TxLegacy {
         chain_id: Some(CHAIN_ID),
         nonce,

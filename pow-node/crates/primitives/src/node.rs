@@ -84,8 +84,7 @@ pub struct BlockHeader {
 
 /// A transaction that has been included in a block.
 ///
-/// `input` is always empty: Breeja rejects anything with calldata, because it
-/// has no EVM to run it with.
+/// `input` is empty while the mempool accepts only plain ETH transfers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Transaction {
@@ -119,8 +118,7 @@ pub struct TransactionReceipt {
     pub gas_used: u64,
     pub cummulative_gas_used: u64,
     pub effective_gas_price: u128,
-    /// `1` for success. Breeja only ever includes transactions it has already
-    /// validated, so a receipt is never a failure.
+    /// `1` for successful EVM execution; `0` for a revert or halt.
     pub status: u8,
 }
 

@@ -110,19 +110,19 @@ away from locked live state. `Database` answers reads as execution requests them
 `DatabaseCommit` persists the returned changes in the working snapshot. My M1
 decisions below explain the code/storage representation.
 
-I will use Shanghai execution with Breeja's teaching proof of work and 5 ETH reward.
+I configured Shanghai execution with Breeja's teaching proof of work and 5 ETH reward.
 I understand that this deliberate mixture is not a historical Ethereum network
 configuration. I will compile the Solidity demo explicitly for Shanghai so its
-target matches the VM, and set base fee to zero to preserve the no-burn supply model.
-I will set beneficiary to the miner. REVM pays transaction fees and advances sender
-nonces, so I must remove the old manual fee credit and nonce increment when replacing
-`apply_transfer`. I will keep the node's block reward payment and use `tx_gas_used()`.
+target matches the VM. I set base fee to zero to preserve the no-burn supply model,
+and beneficiary to the miner. REVM pays transaction fees and advances sender
+nonces, so I removed the old manual fee credit and nonce increment when replacing
+`apply_transfer`. I kept the node's block reward payment and use `tx_gas_used()`.
 
-I will build execution's block environment before running transactions: number,
+I build execution's block environment before running transactions: number,
 timestamp, gas limit, difficulty, miner and parent hash must agree with the header
-later mined. I will use the parent hash as `prevrandao`; the candidate's own hash
-cannot exist before execution and mining finish. I also need to supply historical
-block hashes to the database for `BLOCKHASH`.
+later mined. I use the parent hash as `prevrandao`; the candidate's own hash cannot
+exist before execution and mining finish. I also supply historical block hashes
+to the database for `BLOCKHASH`.
 
 In M4, I will discard simulation changes and document my validation choices.
 For gas estimation, I will probe copied state and test the estimate by sending a
@@ -231,6 +231,66 @@ historical snapshot isolation. My M1 checks passed:
 
 I have completed all M1 acceptance checks in `FINAL-PROJECT.md`.
 
-M2–M6 are still pending. I have not replaced `apply_transfer` or enabled contract
-execution yet. My next execution check is the M2 parity test: a transfer through
-REVM must use exactly 21,000 gas and preserve the same balances and nonce behavior.
+My M1 checkpoint is `6a85d48` (`feat(evm): add M1 code and storage snapshot database`).
+
+## M2: transfers through REVM
+
+I wrote the transfer parity test before implementing `execute_transaction` in
+`executor.rs`. It now proves that a plain transfer uses exactly **21,000 gas**,
+moves the expected value, pays the beneficiary exactly once, and advances the
+sender's nonce exactly once. Total ETH is conserved across the transaction.
+
+I replaced `apply_transfer` with REVM execution over `BreejaDb`. I map the pending
+transaction's sender, destination, value, nonce, gas limit, gas price and chain ID
+into a legacy `TxEnv`. I map the candidate block into `BlockEnv`, including its
+miner as beneficiary and parent hash as `prevrandao`. The pool still admits only
+transfers, so calldata remains empty for this milestone.
+
+I take actual gas from `tx_gas_used()` and receipt status from `is_success()`.
+Validity errors return without committing snapshot changes. For an execution
+outcome, I drop the EVM to release its database borrow, then commit the returned
+state. I removed manual transfer debits, recipient/fee credits and nonce bumps;
+REVM performs them. I retained the separate block reward after the transactions.
+
+I changed the miner to create its candidate block before execution so EVM-visible
+fields match the header later mined. Account and recent-block-hash snapshots are
+taken under the read lock; database construction, execution and proof of work
+happen after releasing it. Execution fills the candidate's roots and gas usage,
+then proof of work supplies its nonce and hash. The existing seal verification,
+difficulty adjustment and brief write-lock commit remain intact.
+
+I adapted the seven existing executor tests to the database/block signature,
+with a code comment explaining the setup change. I kept their economic expectations
+and the mining supply-conservation assertion unchanged. My six new tests cover
+parity, unused gas, up-front affordability, per-transaction block gas validation,
+chain ID validation and a sender who is also the miner. One important distinction:
+enough ETH for the eventual 21,000-gas bill is insufficient if the sender cannot
+cover the transaction's larger declared gas limit up front.
+
+My M2 verification passed:
+
+- `cargo test --workspace --locked --offline`: **65 passed**, including all 8
+  mining integration tests and all 13 real-server RPC tests; none ignored.
+- `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`:
+  no warnings.
+- `cargo build --release --locked --offline`: passed.
+- A fresh `cargo run --release --locked --offline -- --dev` node, with an ephemeral
+  RPC port and a separate miner address, accepted the exact `cast mktx` transaction
+  arguments from the README. The node shut down cleanly afterward.
+
+I recorded this live transfer evidence:
+
+| Check | Result |
+| --- | --- |
+| Transaction hash | `0x22d76a11db763d4b5cc16135b4d8ee08acdce86bb84fb87f4a9fd353176bba26` |
+| Inclusion | Block 12, status `0x1` |
+| Gas / fee | 21,000 gas / 21,000,000,000,000 wei |
+| Sender nonce | 1 |
+| Sender balance | 9,998.999979 ETH |
+| Recipient balance | 10,001 ETH |
+| Supply at block 14 | Exactly 40,000 ETH genesis + 14 × 5 ETH rewards |
+
+I have completed M2's acceptance checks. M3–M6 remain pending: contract admission,
+deployment/log receipts, RPC simulation and inspection, and the final variable-gas
+block selection, storage-root and bloom work. The current pool batch size still
+assumes transfer costs; cumulative variable-gas enforcement belongs to M6.

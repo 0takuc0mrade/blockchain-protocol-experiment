@@ -145,8 +145,8 @@ pub fn admit(state: &mut BlockState, raw: &Bytes) -> Result<B256, anyhow::Error>
     }
 
     // Ethereum reserves the full gas limit up front and refunds whatever the
-    // transaction does not burn. Breeja always burns exactly the intrinsic cost,
-    // but it reserves the limit anyway so the accounting matches.
+    // transaction does not burn. REVM charges actual gas used at execution, but
+    // admission must still reserve the sender's maximum possible liability.
     let max_cost = tx.value + U256::from(tx.gas) * U256::from(tx.gas_price);
     let available = state.get_pending_balance(&tx.from);
     if available < max_cost {
