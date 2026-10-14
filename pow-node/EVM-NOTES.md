@@ -1,43 +1,20 @@
 # Breeja EVM project notes
 
-Working draft, started 14 October 2026. The requirements are in
-[FINAL-PROJECT.md](FINAL-PROJECT.md); milestone completion must be checked against
-that file. These notes combine the student's orientation answers with the code
-review and verification evidence. Planned behavior below is not implemented yet.
+I started this working draft on 14 October 2026 to record my understanding of
+Breeja, my integration decisions, and the evidence behind them. I am following
+[FINAL-PROJECT.md](FINAL-PROJECT.md) and checking each milestone against its
+requirements. My implementation plans below are still pending unless I explicitly
+record a completed check.
 
-## Schedule and working agreement
+## My starting point
 
-Submission is Wednesday, **21 October 2026**, GMT+1 (Africa/Lagos); the submission
-hour has not been supplied. There are two hours available daily. Aim to finish
-verification and the write-up on 20 October, leaving submission day as a buffer.
-
-| Session | Scope from the brief | Evidence required before moving on |
-| --- | --- | --- |
-| 14 October | Part 0 and M0: orientation, branch, baseline | Four orientation answers; 48 passing tests; REVM builds; release mining output |
-| 15 October | M1: code, storage, database adapter | Existing tests pass; database reads and commits tested, including unknown addresses |
-| 16 October | M2: transfer parity through REVM | Exactly 21,000 gas; correct fees and nonces; mining and supply conservation pass |
-| 17 October | M3: deployment, calls, logs, failed execution | Contract code committed; storage and logs persist; revert mined and charged |
-| 18 October | M4: simulation and estimation | `eth_call` returns data without changing state; estimated gas actually succeeds |
-| 19 October | M5: contract inspection RPC | Historical code/storage; log range/address filters; topic filters and `eth_gasPrice` targeted |
-| 20 October | M6, demo, final write-up and checks | Variable block gas; storage-sensitive roots; correct bloom; Solidity demo; release build and clean clippy |
-| 21 October | Submission buffer | Review final evidence and submit the PR against the fork |
-
-Each session budgets roughly 15 minutes for explanation, 65 for implementation
-with decision updates, 30 for verification, and 10 for notes and a milestone
-commit. Revisit the relevant brief section before each milestone. Explain what
-changes, why it is needed, and how the test proves it. Record failures and limits
-honestly. Preserve existing tests; any changed expectation needs a comment
-explaining why the previous expectation was wrong. Required work precedes stretch
-goals. Dates are a working plan, not a claim that the milestones are complete.
-
-## What already exists
-
-`bin/breeja` starts genesis, the miner thread, and the JSON-RPC server.
-`crates/primitives` defines accounts, blocks, transactions, receipts, and chain
+I traced the existing node from its entry point through transaction validation,
+execution, mining, and RPC responses. `bin/breeja` starts genesis, the miner thread,
+and the JSON-RPC server. `crates/primitives` defines accounts, blocks, transactions, receipts, and chain
 state. `crates/node` validates transactions and mines blocks. `crates/rpc` exposes
 eleven methods using jsonrpsee.
 
-A submitted transfer travels through this path:
+I understand the current transfer path as:
 
 ```text
 signed transaction -> RPC -> pool validation -> mempool
@@ -45,142 +22,148 @@ signed transaction -> RPC -> pool validation -> mempool
     -> proof of work -> commit block, transactions, receipts and history
 ```
 
-The pool recovers the sender from the signature and checks chain ID, pending
-nonce, available balance and gas. The executor debits value plus the fee,
+In the pool, I found that the sender is recovered from the signature, with checks
+for chain ID, pending nonce, available balance and gas. The executor debits value plus the fee,
 credits the recipient and miner, and increments the nonce. Every accepted
 transaction currently consumes 21,000 gas. Mining searches for a nonce whose
 header hash has enough leading zero bits, links the result to the parent, and
 adjusts difficulty.
 
-The miner releases the shared `RwLock` after taking its snapshot. Execution and
-proof of work happen outside the lock; committing takes a short write lock. This
-structure must remain when contract execution becomes more expensive.
+I need to preserve the miner's locking structure. It releases the shared `RwLock`
+after taking its snapshot. Execution and proof of work happen outside the lock;
+committing takes a short write lock. Holding the lock through contract execution
+would block RPC requests for the duration of that work.
 
-Accounts currently contain nonce, balance, `storage_root` and `code_hash`, but
-the two hashes are placeholders. They have no code bytes or storage map.
+In the starting `Account`, I found nonce, balance, `storage_root` and `code_hash`,
+but the two hashes were placeholders. Accounts had no code bytes or storage map.
 `PendingTransaction` has neither calldata nor an optional destination, so contract
 creation and calls require changes to transaction plumbing as well as execution.
 Receipts have no stored contract address or logs; their RPC forms manufacture
 `null`, empty logs and a zero bloom. `eth_call` and `eth_estimateGas` refuse
-requests needing execution. State and history are in memory; restart persistence
-and networking are outside the required scope.
+requests needing execution. I also found that state and history are in memory;
+I am keeping restart persistence and networking outside this project's required scope.
 
 ## Part 0: orientation answers
 
-### 1. Which pool checks change?
+### 1. Which pool checks do I need to change?
 
-The identified checks are correct: the `TxKind::Create` rejection, the rejection
+I identified three checks: the `TxKind::Create` rejection, the rejection
 of non-empty `envelope.input()`, and `gas < TRANSFER_GAS` in `pool.rs`.
 
-Remove the two blanket contract rejections once execution supports contracts.
-Preserve the creation/call distinction and calldata in the pending transaction.
-Replace the transfer-only gas check with a transaction-specific intrinsic-gas
+I will remove the two blanket contract rejections once execution supports contracts.
+I will preserve the creation/call distinction and calldata in the pending transaction,
+and replace the transfer-only gas check with a transaction-specific intrinsic-gas
 calculation. **Variable execution gas does not remove the minimum gas requirement.**
 The base is still 21,000, calldata adds 4 gas per zero byte and 16 per non-zero
 byte, and creation adds 32,000. Shanghai also meters initcode words and limits
-initcode size; use rules matching the chosen REVM spec. Reject a gas limit below
-the calculated minimum. Existing signature, nonce and funding checks still apply.
+initcode size, so I need rules matching the chosen REVM spec. I will reject a gas
+limit below the calculated minimum and retain signature, nonce and funding checks.
 
-This corrects the initial proposal to remove the third check: the floor changes
-from a constant to a calculation.
+I initially thought I could remove the third check because gas becomes variable.
+I now understand that the floor changes from a constant to a calculation.
 
 ### 2. Should execution failure still mean skipping the transaction?
 
-Only a transaction that is invalid for the candidate state should be skipped,
-such as one with a wrong nonce or insufficient up-front funds. A valid transaction
+I need to distinguish an invalid transaction from a valid transaction whose
+execution fails. Only a transaction that is invalid for the candidate state should
+be skipped, such as one with a wrong nonce or insufficient up-front funds. A valid transaction
 can start execution and then revert or halt. It is still included, consumes its
 sender's nonce, charges gas, and receives `status: 0x0`.
 
 REVM separates transaction-validity errors from `ExecutionResult::Success`,
 `Revert`, and `Halt`. A revert rolls back the attempted contract changes while
 preserving transaction-level gas charging and nonce advancement. Out of gas is
-a halt and uses the transaction's gas limit. The executor must retain failed
-execution receipts rather than treating every failure as invalid admission.
+a halt and uses the transaction's gas limit. I will retain failed execution
+receipts rather than treating every failure as invalid admission.
 
 ### 3. Why reserve the gas limit but charge only gas used?
 
-`gas_limit * gas_price` is the maximum possible gas liability. Admission must
-ensure the sender can cover it plus the transferred value, including liabilities
+My understanding is that `gas_limit * gas_price` is the maximum possible gas
+liability. Admission must ensure the sender can cover it plus the transferred value, including liabilities
 of transactions already queued. Today the executor charges only `TRANSFER_GAS`
 because every accepted transaction is a plain transfer.
 
-With REVM, gas used becomes variable. The sender must still cover the maximum
-up front but pays for the actual charged gas; unused gas allowance is released.
+When I integrate REVM, gas used becomes variable. The sender must still cover the
+maximum up front but pays for the actual charged gas; unused gas allowance is released.
 The gas limit is a ceiling, not the final bill. REVM performs this accounting.
 
 ### 4. What do historical snapshots cost once storage exists?
 
-`BlockState` clones the complete account map after each block. Once accounts
-contain code and large storage maps, copying unchanged state becomes expensive.
+I found that `BlockState` clones the complete account map after each block. Once
+accounts contain code and large storage maps, copying unchanged state becomes expensive.
 With deep storage copies, memory grows roughly with the sum of all historical
 state sizes, and an unchanged chain state of size S retained for B blocks costs
 O(B * S). Snapshot creation also costs time inside the commit lock.
 
 Shared immutable code bytes or a code-by-hash table can avoid duplicating bytecode;
-they do not solve repeated storage-map copies. Keep the teaching snapshot model
-for this project, document its limit, and test that historical storage remains
-independent of later writes. A trie or versioned storage is a separate project.
+they do not solve repeated storage-map copies. I plan to keep the teaching snapshot
+model for this project, document its limit, and test that historical storage
+remains independent of later writes. I am leaving a trie or versioned storage
+for a separate project.
 
 ## Integration decisions and acceptance checks
 
-Use REVM 43, the default route in the brief. The existing lockfile resolves
-43.0.3; inspect that installed source when checking APIs. M1 will introduce
-`crates/node/src/evm.rs` around an owned snapshot, rather than implementing REVM's
-database interface directly on the locked live state. `Database` answers reads
-as execution requests them; `DatabaseCommit` persists the returned changes.
-Finalize the code/storage representation during M1 and explain the trade-off.
+I am taking the brief's default route, REVM 43. The existing lockfile resolves
+43.0.3, so I check APIs against that installed source. In M1, I introduced
+`crates/node/src/evm.rs` around an owned snapshot, keeping REVM's database interface
+away from locked live state. `Database` answers reads as execution requests them;
+`DatabaseCommit` persists the returned changes in the working snapshot. My M1
+decisions below explain the code/storage representation.
 
-Use Shanghai execution with Breeja's teaching proof of work and 5 ETH reward.
-This deliberate mixture is not a historical Ethereum network configuration.
-Compile the Solidity demo explicitly for Shanghai so its target matches the VM.
-Set base fee to zero to preserve the no-burn supply model. Set beneficiary to
-the miner: REVM pays transaction fees and advances sender nonces, so remove the
-old manual fee credit and nonce increment when replacing `apply_transfer`.
-Continue paying the block reward ourselves. Use `tx_gas_used()`.
+I will use Shanghai execution with Breeja's teaching proof of work and 5 ETH reward.
+I understand that this deliberate mixture is not a historical Ethereum network
+configuration. I will compile the Solidity demo explicitly for Shanghai so its
+target matches the VM, and set base fee to zero to preserve the no-burn supply model.
+I will set beneficiary to the miner. REVM pays transaction fees and advances sender
+nonces, so I must remove the old manual fee credit and nonce increment when replacing
+`apply_transfer`. I will keep the node's block reward payment and use `tx_gas_used()`.
 
-Build execution's block environment before running transactions: number,
+I will build execution's block environment before running transactions: number,
 timestamp, gas limit, difficulty, miner and parent hash must agree with the header
-later mined. Use the parent hash as `prevrandao`; the candidate's own hash cannot
-exist before execution and mining finish. Supply historical block hashes to the
-database for `BLOCKHASH`.
+later mined. I will use the parent hash as `prevrandao`; the candidate's own hash
+cannot exist before execution and mining finish. I also need to supply historical
+block hashes to the database for `BLOCKHASH`.
 
-M4 must discard simulation changes and document validation choices. Gas
-estimation must probe copied state and return an estimate tested by sending a
-transaction with that exact limit. Binary search is a heuristic for contracts
-whose behavior depends on remaining gas.
+In M4, I will discard simulation changes and document my validation choices.
+For gas estimation, I will probe copied state and test the estimate by sending a
+transaction with that exact limit. I understand that binary search is a heuristic
+for contracts whose behavior depends on remaining gas.
 
-M6 must select transactions by gas, update storage/code commitments and construct
-blooms from actual logs. Receipt `to` is null for creation, and logs need block
-and transaction metadata for RPC filtering. Preserve Ethereum's distinction
-between minimal hex quantities and fixed-width data: storage results are 32 bytes.
+In M6, I will select transactions by gas, update storage/code commitments and
+construct blooms from actual logs. I need receipt `to` to be null for creation,
+and logs to include block and transaction metadata for RPC filtering. I will
+preserve Ethereum's distinction between minimal hex quantities and fixed-width
+data: storage results are 32 bytes.
 
-All 14 entries in the brief's testing requirements are tracked by their milestone
-above, including existing supply conservation. The M6 acceptance checks additionally
-require storage-sensitive roots and bloom verification. Final deliverables are
-the `feat/evm` branch, passing old and new tests, release build, warning-free clippy,
-a Solidity deployment/call demo, this 2–4 page write-up revised to reflect what
-actually shipped, and a PR against the fork.
+I will verify all 14 entries in the brief's testing requirements, including
+existing supply conservation, and the additional M6 checks for storage-sensitive
+roots and blooms. My final deliverables are the `feat/evm` branch, passing old and
+new tests, a release build, warning-free clippy, a Solidity deployment/call demo,
+this 2–4 page write-up revised to reflect what I actually shipped, and a PR
+against my fork.
 
 ## M0 evidence and current status
 
-- Starting commit: `bbbdf34` (`sync rename`). Branch created: `feat/evm`.
-- Pre-existing uncommitted changes: REVM dependency in `crates/node/Cargo.toml`
-  and the corresponding `Cargo.lock` updates. These were preserved.
-- Rust compiler: 1.95.0; Cargo: 1.95.0. REVM 43.0.3 is available locally and
-  compiles with the workspace.
-- `cargo test --workspace --locked --offline`: **48 passed**, none ignored
+My baseline verification established the following:
+
+- I started from `bbbdf34` (`sync rename`), with `feat/evm` as my project branch.
+- I retained the REVM dependency already added in `crates/node/Cargo.toml`
+  and the corresponding `Cargo.lock` updates.
+- My toolchain is Rust 1.95.0 and Cargo 1.95.0. REVM 43.0.3 is available locally
+  and compiles with the workspace.
+- My `cargo test --workspace --locked --offline` baseline is **48 passed**, none ignored
   (13 node unit tests, 8 mining tests, 14 primitives tests, 13 RPC tests).
-  The initial sandbox run could not bind RPC sockets; rerunning with local
-  socket access passed all tests without changing code or assertions.
-- `cargo build --release --locked --offline`: passed (initial release compilation
+  My initial sandbox run could not bind RPC sockets; the rerun with local
+  socket access passed all tests without changes to code or assertions.
+- My `cargo build --release --locked --offline` check passed (initial release compilation
   took 2m 10s).
-- `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`:
-  passed with no warnings.
-- Release mining smoke test: passed; 20 empty blocks sealed, difficulty adjusted,
+- My `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`
+  check passed with no warnings.
+- My release mining smoke test passed: 20 empty blocks sealed, difficulty adjusted,
   the RPC server started with 11 methods, and the miner shut down cleanly.
-  An ephemeral localhost port avoids occupying a development node's usual 8545.
-  The environment sets `RUST_LOG=warn`, so `info` was explicitly enabled to
-  capture evidence. The command uses a five-second interrupt; `timeout` returns
+  I used an ephemeral localhost port to avoid occupying a development node's usual 8545.
+  My environment sets `RUST_LOG=warn`, so the run explicitly enabled `info` to
+  capture evidence. My command uses a five-second interrupt; `timeout` returns
   124 by design, even when the node handles the interrupt and exits cleanly.
 
 ```bash
@@ -188,7 +171,7 @@ RUST_LOG=info timeout --signal=INT --kill-after=5s 5s \
   cargo run --release --locked --offline -- --dev --rpc-address 127.0.0.1:0
 ```
 
-Selected output from the run (timestamps as printed, in UTC):
+I recorded the following output from the run (timestamps as printed, in UTC):
 
 ```text
 2026-10-14T13:05:05.916295Z  INFO genesis block sealed genesis_hash=0xcd766ee455099bf23b095ee57164331abc356e93bb7757cd33d50ac109bc1434 accounts=4
@@ -200,6 +183,54 @@ Selected output from the run (timestamps as printed, in UTC):
 2026-10-14T13:05:09.894983Z  INFO miner stopped
 ```
 
-Part 0 and M0 acceptance checks are complete; this document and the existing REVM
-dependency changes form the M0 checkpoint.
-M1–M6 are pending; no contract execution capabilities have been implemented yet.
+I have completed the Part 0 and M0 acceptance checks. My M0 checkpoint is
+`813e188` (`chore(evm): record M0 baseline and orientation`), containing these
+notes and the existing REVM dependency changes.
+
+## M1: code, storage and the database adapter
+
+I extended `Account` with runtime `code: Bytes` and `storage: HashMap<U256, U256>`.
+I chose raw bytes to keep the primitives crate independent of REVM. Snapshot
+clones share immutable byte allocations but copy storage maps, so later writes
+cannot change historical values. I added current and historical code/storage
+accessors and a snapshot of the last 256 block hashes for `BLOCKHASH`.
+
+I kept the existing four-field account RLP: nonce, balance, storage root and code
+hash. I excluded the raw payloads with `#[rlp(skip)]`, because their commitments
+belong in the hash fields. `set_code` installs bytes and their hash together.
+Storage-root calculation is still pending M6; at this stage, a storage-only
+change does not yet affect the state root. I have not weakened or changed any
+existing test expectations.
+
+I implemented `BreejaDb` in `crates/node/src/evm.rs`. Its code-by-hash cache analyzes
+identical bytecode once per snapshot; this is not a global deduplicated code store.
+`basic` returns balance, nonce and the hash derived from the actual code, leaving
+REVM to load code on demand through `code_by_hash`. Deriving that hash also gives
+REVM the correct empty-code hash while preserving Breeja's existing placeholder
+hashes in accounts that have not changed. I return `None` for an unknown address
+without inserting it, and zero for a missing storage slot.
+
+I commit only touched accounts, remove accounts flagged as selfdestructed, clear
+old storage for newly created accounts, and remove slots written to zero. I preserve
+existing code when REVM has not loaded it. REVM's account record also contains
+execution flags and original/current storage values; I persist the current values
+in Breeja's simpler account type. These changes affect only the owned working
+snapshot; the miner still controls when a sealed block reaches live state.
+
+My nine adapter tests cover funded and unknown accounts, code/storage reads,
+block hashes, complete commits, untouched accounts, deletion, new-account storage
+and zero writes. My two additional primitives tests cover missing values and
+historical snapshot isolation. My M1 checks passed:
+
+- `cargo test --workspace --locked --offline`: **59 passed**, including all 48
+  original tests and 11 new tests; none ignored.
+- `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`:
+  no warnings.
+- `cargo build --release --locked --offline`: passed.
+- Formatting checks for the changed Rust files and `git diff --check`: passed.
+
+I have completed all M1 acceptance checks in `FINAL-PROJECT.md`.
+
+M2–M6 are still pending. I have not replaced `apply_transfer` or enabled contract
+execution yet. My next execution check is the M2 parity test: a transfer through
+REVM must use exactly 21,000 gas and preserve the same balances and nonce behavior.

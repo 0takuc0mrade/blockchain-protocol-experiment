@@ -9,8 +9,7 @@ use crate::constants::{
     MIN_DIFFICULTY_LEADING_ZEROS, TRANSFER_GAS,
 };
 
-/// An externally owned account: Ethereum's account record, minus everything a
-/// contract would need.
+/// An Ethereum account, including contract code and persistent storage.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, RlpEncodable)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
@@ -18,6 +17,16 @@ pub struct Account {
     pub balance: U256,
     pub storage_root: B256,
     pub code_hash: B256,
+    /// Immutable runtime bytes. Cloning a snapshot shares this allocation.
+    /// The four-field account RLP commits to code through `code_hash`.
+    #[rlp(skip)]
+    #[serde(default)]
+    pub code: Bytes,
+    /// Missing slots read as zero. Snapshot clones copy this map independently.
+    /// Storage belongs behind `storage_root`, outside the account RLP itself.
+    #[rlp(skip)]
+    #[serde(default)]
+    pub storage: HashMap<U256, U256>,
 }
 
 /// A sealed block.
@@ -166,6 +175,12 @@ impl Account {
             balance,
             ..Default::default()
         }
+    }
+
+    /// Installs runtime code and its commitment together.
+    pub fn set_code(&mut self, code: Bytes) {
+        self.code_hash = keccak256(&code);
+        self.code = code;
     }
 
     /// Consumes this account's current nonce and advances it, the way sending a
@@ -401,7 +416,7 @@ impl BlockState {
         self.receipts.get(hash)
     }
 
-    // account queries 
+    // account queries
 
     /// Account at the chain head. An address nobody has ever funded reads as an
     /// empty account rather than an error, exactly as on Ethereum.
@@ -415,6 +430,42 @@ impl BlockState {
         self.state_history
             .get(number as usize)
             .map(|snapshot| snapshot.get(address).cloned().unwrap_or_default())
+    }
+
+    /// Runtime bytecode at the chain head, empty for an address without code.
+    pub fn get_code(&self, address: &Address) -> Bytes {
+        self.accounts
+            .get(address)
+            .map(|account| account.code.clone())
+            .unwrap_or_default()
+    }
+
+    /// Runtime bytecode after a historical block, or `None` for an unknown block.
+    pub fn get_code_at(&self, address: &Address, number: u64) -> Option<Bytes> {
+        self.state_history.get(number as usize).map(|snapshot| {
+            snapshot
+                .get(address)
+                .map(|account| account.code.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    /// A storage slot at the chain head, zero if the address or slot is absent.
+    pub fn get_storage(&self, address: &Address, slot: U256) -> U256 {
+        self.accounts
+            .get(address)
+            .and_then(|account| account.storage.get(&slot).copied())
+            .unwrap_or_default()
+    }
+
+    /// A storage slot after a historical block, or `None` for an unknown block.
+    pub fn get_storage_at(&self, address: &Address, slot: U256, number: u64) -> Option<U256> {
+        self.state_history.get(number as usize).map(|snapshot| {
+            snapshot
+                .get(address)
+                .and_then(|account| account.storage.get(&slot).copied())
+                .unwrap_or_default()
+        })
     }
 
     /// The nonce the sender's *next* transaction must carry: the mined nonce plus
@@ -447,6 +498,16 @@ impl BlockState {
     /// without holding the state lock.
     pub fn accounts_snapshot(&self) -> HashMap<Address, Account> {
         self.accounts.clone()
+    }
+
+    /// The previous 256 blocks available to the next candidate's BLOCKHASH opcode.
+    pub fn block_hashes_snapshot(&self) -> HashMap<u64, B256> {
+        self.blocks
+            .iter()
+            .rev()
+            .take(256)
+            .map(|block| (block.number, block.hash))
+            .collect()
     }
 
     // mempool
@@ -598,6 +659,77 @@ mod tests {
         let mut three = one.clone();
         three.insert(a, Account::new(U256::from(99u64)));
         assert_ne!(state_root_of(&one), state_root_of(&three));
+    }
+
+    #[test]
+    fn missing_code_and_storage_are_empty_but_unknown_blocks_are_missing() {
+        let state = BlockState::new_with_gensis(BreejaGenesis::default(), 8);
+        let address = Address::repeat_byte(0x11);
+
+        assert!(state.get_code(&address).is_empty());
+        assert_eq!(state.get_storage(&address, U256::ZERO), U256::ZERO);
+        assert_eq!(state.get_code_at(&address, 0), Some(Bytes::new()));
+        assert_eq!(
+            state.get_storage_at(&address, U256::ZERO, 0),
+            Some(U256::ZERO)
+        );
+        assert_eq!(state.get_code_at(&address, 1), None);
+        assert_eq!(state.get_storage_at(&address, U256::ZERO, 1), None);
+    }
+
+    #[test]
+    fn contract_snapshots_preserve_historical_code_and_storage() {
+        let address = Address::repeat_byte(0x11);
+        let code = Bytes::from_static(&[0x60, 0x2a, 0x00]);
+        let mut state = BlockState::new_with_gensis(BreejaGenesis::default(), 8);
+        let mut account = Account::default();
+        account.set_code(code.clone());
+        account.storage.insert(U256::ZERO, U256::from(42));
+
+        // These synthetic blocks exercise storage/history, not proof of work.
+        // The mining integration tests separately verify real block seals.
+        let mut block = state.head().clone();
+        block.number = 1;
+        block.parent_hash = state.head().hash;
+        block.hash = B256::repeat_byte(0x01);
+        let accounts = HashMap::from([(address, account)]);
+        block.state_root = state_root_of(&accounts);
+        state.commit_block(accounts, block, Vec::new(), Vec::new());
+
+        assert_eq!(state.get_code(&address), code);
+        assert_eq!(state.get_storage(&address, U256::ZERO), U256::from(42));
+        assert!(state.get_code_at(&address, 0).unwrap().is_empty());
+        assert_eq!(
+            state.get_storage_at(&address, U256::ZERO, 0),
+            Some(U256::ZERO)
+        );
+
+        let mut snapshot = state.accounts_snapshot();
+        snapshot
+            .get_mut(&address)
+            .unwrap()
+            .storage
+            .insert(U256::ZERO, U256::from(84));
+        assert_eq!(state.get_storage(&address, U256::ZERO), U256::from(42));
+
+        let mut block = state.head().clone();
+        block.number = 2;
+        block.parent_hash = state.head().hash;
+        block.hash = B256::repeat_byte(0x02);
+        block.state_root = state_root_of(&snapshot);
+        state.commit_block(snapshot, block, Vec::new(), Vec::new());
+
+        assert_eq!(state.get_storage(&address, U256::ZERO), U256::from(84));
+        assert_eq!(
+            state.get_storage_at(&address, U256::ZERO, 1),
+            Some(U256::from(42))
+        );
+        assert_eq!(
+            state.get_storage_at(&address, U256::ZERO, 2),
+            Some(U256::from(84))
+        );
+        assert_eq!(state.get_code_at(&address, 1), Some(code.clone()));
+        assert_eq!(state.get_code_at(&address, 2), Some(code));
     }
 
     #[test]
