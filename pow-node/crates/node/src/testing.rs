@@ -36,8 +36,6 @@ pub fn sign_transfer_with(
     gas_price: u128,
     gas_limit: u64,
 ) -> Result<Bytes, anyhow::Error> {
-    let signer: PrivateKeySigner = private_key.parse()?;
-
     // 1. Empty calldata keeps this helper specific to plain ETH transfers.
     let tx = TxLegacy {
         chain_id: Some(CHAIN_ID),
@@ -49,6 +47,57 @@ pub fn sign_transfer_with(
         input: Bytes::new(),
     };
 
+    sign_transaction(private_key, tx)
+}
+
+/// Signs contract creation with zero value and the chain's default gas price.
+pub fn sign_deployment(
+    private_key: &str,
+    initcode: Bytes,
+    nonce: u64,
+    gas_limit: u64,
+) -> Result<Bytes, anyhow::Error> {
+    sign_transaction(
+        private_key,
+        TxLegacy {
+            chain_id: Some(CHAIN_ID),
+            nonce,
+            gas_price: GAS_PRICE,
+            gas_limit,
+            to: TxKind::Create,
+            value: U256::ZERO,
+            input: initcode,
+        },
+    )
+}
+
+/// Signs a contract call, including calldata and an optional ETH payment.
+pub fn sign_contract_call(
+    private_key: &str,
+    to: Address,
+    value: U256,
+    input: Bytes,
+    nonce: u64,
+    gas_limit: u64,
+) -> Result<Bytes, anyhow::Error> {
+    sign_transaction(
+        private_key,
+        TxLegacy {
+            chain_id: Some(CHAIN_ID),
+            nonce,
+            gas_price: GAS_PRICE,
+            gas_limit,
+            to: TxKind::Call(to),
+            value,
+            input,
+        },
+    )
+}
+
+/// Signs and wire-encodes a legacy transaction for integration tests and demos.
+pub fn sign_transaction(private_key: &str, tx: TxLegacy) -> Result<Bytes, anyhow::Error> {
+    let signer: PrivateKeySigner = private_key.parse()?;
+
     // 2 and 3. Sign the signature hash, which commits to every field above.
     let signature = signer.sign_hash_sync(&tx.signature_hash())?;
 
@@ -58,6 +107,20 @@ pub fn sign_transfer_with(
     signed.encode_2718(&mut encoded);
 
     Ok(Bytes::from(encoded))
+}
+
+/// The contract supplied in M3: storage[0] = 42, then an empty LOG0.
+pub const TEST_CONTRACT_INITCODE: &str = "0x600b600c600039600b6000f3602a60005560006000a000";
+pub const TEST_CONTRACT_RUNTIME: &str = "0x602a60005560006000a000";
+
+/// Wraps a short hand-assembled runtime in creation code for test fixtures.
+pub fn initcode_for_runtime(runtime: &[u8]) -> Bytes {
+    let length = u8::try_from(runtime.len()).expect("test runtime must fit in PUSH1");
+    let mut initcode = vec![
+        0x60, length, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, length, 0x60, 0x00, 0xf3,
+    ];
+    initcode.extend_from_slice(runtime);
+    Bytes::from(initcode)
 }
 
 /// The address a private key controls.

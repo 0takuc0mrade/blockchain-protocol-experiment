@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     constants::{EXTRA_DATA, TRANSFER_GAS},
-    node::{Block, Transaction, TransactionReceipt},
+    node::{Block, Log, Transaction, TransactionReceipt},
 };
 
 /// Encodes a number as an Ethereum *quantity*: minimal hex, `0x0` for zero.
@@ -72,7 +72,7 @@ pub struct TransactionResponse {
     pub transaction_index: String,
     pub chain_id: String,
     pub from: String,
-    pub to: String,
+    pub to: Option<String>,
     pub value: String,
     pub nonce: String,
     pub gas: String,
@@ -95,19 +95,48 @@ pub struct TransactionReceiptResponse {
     pub block_hash: String,
     pub block_number: String,
     pub from: String,
-    pub to: String,
+    pub to: Option<String>,
     pub gas_used: String,
+    #[serde(rename = "cumulativeGasUsed")]
     pub cummulative_gas_used: String,
     pub effective_gas_price: String,
-    /// Always `null`: deploying a contract needs an EVM, so Breeja rejects it.
     pub contract_address: Option<String>,
-    /// Always empty: logs are emitted by the `LOG*` opcodes, and there is no EVM
-    /// to execute them.
-    pub logs: Vec<serde_json::Value>,
+    pub logs: Vec<LogResponse>,
     pub logs_bloom: String,
     pub status: String,
     #[serde(rename = "type")]
     pub tx_type: String,
+}
+
+/// Ethereum's JSON-RPC form of one mined log.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogResponse {
+    pub address: String,
+    pub topics: Vec<String>,
+    pub data: String,
+    pub block_hash: String,
+    pub block_number: String,
+    pub transaction_hash: String,
+    pub transaction_index: String,
+    pub log_index: String,
+    pub removed: bool,
+}
+
+impl From<&Log> for LogResponse {
+    fn from(log: &Log) -> Self {
+        Self {
+            address: data_address(&log.address),
+            topics: log.topics.iter().map(data_hash).collect(),
+            data: data_bytes(&log.data),
+            block_hash: data_hash(&log.block_hash),
+            block_number: quantity(log.block_number),
+            transaction_hash: data_hash(&log.transaction_hash),
+            transaction_index: quantity(log.transaction_index),
+            log_index: quantity(log.log_index),
+            removed: false,
+        }
+    }
 }
 
 impl BlockResponse {
@@ -146,7 +175,7 @@ impl From<&Transaction> for TransactionResponse {
             transaction_index: quantity(tx.transaction_index),
             chain_id: quantity(tx.chain_id),
             from: data_address(&tx.from),
-            to: data_address(&tx.to),
+            to: tx.to.as_ref().map(data_address),
             value: quantity(tx.value),
             nonce: quantity(tx.nonce),
             gas: quantity(tx.gas),
@@ -168,13 +197,13 @@ impl From<&TransactionReceipt> for TransactionReceiptResponse {
             block_hash: data_hash(&receipt.block_hash),
             block_number: quantity(receipt.block_number),
             from: data_address(&receipt.from),
-            to: data_address(&receipt.to),
+            to: receipt.to.as_ref().map(data_address),
             gas_used: quantity(receipt.gas_used),
             cummulative_gas_used: quantity(receipt.cummulative_gas_used),
             effective_gas_price: quantity(receipt.effective_gas_price),
-            contract_address: None,
-            logs: Vec::new(),
-            // A bloom filter over no logs is 256 zero bytes.
+            contract_address: receipt.contract_address.as_ref().map(data_address),
+            logs: receipt.logs.iter().map(LogResponse::from).collect(),
+            // Bloom construction is completed with the M6 acceptance checks.
             logs_bloom: format!("0x{}", "00".repeat(256)),
             status: quantity(receipt.status),
             tx_type: "0x0".to_owned(),

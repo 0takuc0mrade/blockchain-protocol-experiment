@@ -369,7 +369,7 @@ async fn a_transfer_produces_a_transaction_and_a_receipt() {
     assert_eq!(receipt["to"], format!("{bob:#x}"));
     assert!(
         receipt["contractAddress"].is_null(),
-        "no contracts without an EVM"
+        "a plain transfer does not create a contract"
     );
     assert_eq!(receipt["logs"].as_array().unwrap().len(), 0);
     assert_eq!(receipt["blockHash"], tx["blockHash"]);
@@ -544,4 +544,105 @@ async fn an_unsupported_method_gets_the_standard_method_not_found_error() {
         error.to_string().contains("Method not found") || error.to_string().contains("-32601"),
         "got: {error}"
     );
+}
+
+#[tokio::test]
+async fn deployment_and_contract_logs_are_reported_over_rpc() {
+    use node::testing::{
+        TEST_CONTRACT_INITCODE, TEST_CONTRACT_RUNTIME, sign_contract_call, sign_deployment,
+    };
+
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth() * U256::from(100))], true).await;
+    let raw = sign_deployment(
+        DEV_PRIVATE_KEY,
+        TEST_CONTRACT_INITCODE.parse().unwrap(),
+        0,
+        150_000,
+    )
+    .unwrap();
+    let deployment_hash: String = harness
+        .client
+        .request("eth_sendRawTransaction", rpc_params![raw.to_string()])
+        .await
+        .unwrap();
+    harness
+        .wait_for("deployment receipt", |chain| {
+            chain
+                .read()
+                .get_receipt(&deployment_hash.parse().unwrap())
+                .is_some()
+        })
+        .await;
+    let deployment: Value = harness
+        .client
+        .request(
+            "eth_getTransactionReceipt",
+            rpc_params![deployment_hash.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(deployment["status"], "0x1");
+    assert!(deployment["to"].is_null());
+    let address: Address = deployment["contractAddress"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        harness.chain.read().get_code(&address),
+        TEST_CONTRACT_RUNTIME
+            .parse::<alloy::primitives::Bytes>()
+            .unwrap()
+    );
+    let transaction: Value = harness
+        .client
+        .request("eth_getTransactionByHash", rpc_params![deployment_hash])
+        .await
+        .unwrap();
+    assert!(transaction["to"].is_null());
+    assert_eq!(transaction["input"], TEST_CONTRACT_INITCODE);
+
+    let raw = sign_contract_call(
+        DEV_PRIVATE_KEY,
+        address,
+        U256::ZERO,
+        "0x1234".parse().unwrap(),
+        1,
+        100_000,
+    )
+    .unwrap();
+    let hash: String = harness
+        .client
+        .request("eth_sendRawTransaction", rpc_params![raw.to_string()])
+        .await
+        .unwrap();
+    harness
+        .wait_for("contract call receipt", |chain| {
+            chain.read().get_receipt(&hash.parse().unwrap()).is_some()
+        })
+        .await;
+    let receipt: Value = harness
+        .client
+        .request("eth_getTransactionReceipt", rpc_params![hash.clone()])
+        .await
+        .unwrap();
+    assert_eq!(receipt["status"], "0x1");
+    assert_eq!(receipt["to"], format!("{address:#x}"));
+    assert!(receipt["contractAddress"].is_null());
+    assert!(
+        from_quantity(receipt["cumulativeGasUsed"].as_str().unwrap())
+            >= from_quantity(receipt["gasUsed"].as_str().unwrap())
+    );
+    assert_eq!(receipt["logs"].as_array().unwrap().len(), 1);
+    let log = &receipt["logs"][0];
+    assert_eq!(log["address"], format!("{address:#x}"));
+    assert_eq!(log["blockHash"], receipt["blockHash"]);
+    assert_eq!(log["blockNumber"], receipt["blockNumber"]);
+    assert_eq!(log["transactionHash"], hash);
+    assert_eq!(log["transactionIndex"], receipt["transactionIndex"]);
+    assert_eq!(log["logIndex"], "0x0");
+    assert_eq!(log["data"], "0x");
+    assert_eq!(log["topics"], serde_json::json!([]));
+    assert_eq!(log["removed"], false);
 }

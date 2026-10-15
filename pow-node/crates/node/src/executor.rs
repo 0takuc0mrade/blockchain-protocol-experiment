@@ -1,18 +1,19 @@
 use std::collections::HashMap;
 
-use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
+use alloy::primitives::{Address, B256, TxKind, U256};
 use primitives::{
     constants::{BLOCK_REWARD, CHAIN_ID},
-    node::{Account, Block, PendingTransaction, Transaction, TransactionReceipt, hash_list_root},
+    node::{
+        Account, Block, Log, PendingTransaction, Transaction, TransactionReceipt, hash_list_root,
+    },
 };
 use revm::{
     Context, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext,
     context::{BlockEnv, CfgEnv, TxEnv},
     context_interface::result::ExecutionResult,
-    primitives::hardfork::SpecId,
 };
 
-use crate::evm::BreejaDb;
+use crate::evm::{BreejaDb, EVM_SPEC};
 
 /// What executing a batch of transactions produced.
 pub struct Execution {
@@ -26,7 +27,7 @@ pub struct Execution {
     pub state_root: B256,
 }
 
-/// Executes one pending transfer through REVM and commits its snapshot changes.
+/// Executes a transfer, contract call, or deployment and commits its snapshot changes.
 ///
 /// REVM owns gas charging, beneficiary fees, and the sender's nonce. A validity
 /// error returns `Err` without committing changes; execution success or failure
@@ -48,16 +49,15 @@ pub fn execute_transaction(
         prevrandao: Some(block.parent_hash),
         ..Default::default()
     };
-    let cfg = CfgEnv::new_with_spec(SpecId::SHANGHAI).with_chain_id(CHAIN_ID);
+    let cfg = CfgEnv::new_with_spec(EVM_SPEC).with_chain_id(CHAIN_ID);
     let tx_env = TxEnv {
         tx_type: 0,
         caller: tx.from,
         gas_limit: tx.gas,
         gas_price: tx.gas_price,
-        kind: TxKind::Call(tx.to),
+        kind: tx.to.map(TxKind::Call).unwrap_or(TxKind::Create),
         value: tx.value,
-        // M2 preserves the pool's transfer-only transaction model.
-        data: Bytes::new(),
+        data: tx.input.clone(),
         nonce: tx.nonce,
         chain_id: Some(tx.chain_id),
         ..Default::default()
@@ -101,8 +101,14 @@ pub fn execute_block(mut db: BreejaDb, batch: &[PendingTransaction], block: &Blo
     let mut transactions = Vec::new();
     let mut receipts = Vec::new();
     let mut gas_used = 0u64;
+    let mut log_index = 0u64;
 
     for tx in batch {
+        // Reserve the transaction's declared limit before trying it. It stays
+        // queued if it cannot fit; actual charged gas determines the next budget.
+        if tx.gas > block.gas_limit.saturating_sub(gas_used) {
+            continue;
+        }
         match execute_transaction(&mut db, tx, block) {
             Ok(result) => {
                 let tx_gas = result.tx_gas_used();
@@ -123,7 +129,7 @@ pub fn execute_block(mut db: BreejaDb, batch: &[PendingTransaction], block: &Blo
                     nonce: tx.nonce,
                     gas: tx.gas,
                     gas_price: tx.gas_price,
-                    input: Default::default(),
+                    input: tx.input.clone(),
                     v: tx.v,
                     r: tx.r,
                     s: tx.s,
@@ -136,6 +142,25 @@ pub fn execute_block(mut db: BreejaDb, batch: &[PendingTransaction], block: &Blo
                     block_number: block.number,
                     from: tx.from,
                     to: tx.to,
+                    contract_address: result.created_address(),
+                    logs: result
+                        .logs()
+                        .iter()
+                        .map(|log| {
+                            let entry = Log {
+                                address: log.address,
+                                topics: log.data.topics().to_vec(),
+                                data: log.data.data.clone(),
+                                block_hash: B256::ZERO,
+                                block_number: block.number,
+                                transaction_hash: tx.hash,
+                                transaction_index: index,
+                                log_index,
+                            };
+                            log_index += 1;
+                            entry
+                        })
+                        .collect(),
                     gas_used: tx_gas,
                     cummulative_gas_used: gas_used,
                     effective_gas_price: tx.gas_price,
@@ -170,6 +195,7 @@ pub fn execute_block(mut db: BreejaDb, batch: &[PendingTransaction], block: &Blo
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::Bytes;
     use primitives::{
         constants::{BLOCK_GAS_LIMIT, DEV_ADDRESS, DEV_ADDRESS_1, GAS_PRICE, TRANSFER_GAS},
         node::Block,
@@ -196,7 +222,9 @@ mod tests {
         PendingTransaction {
             hash: B256::repeat_byte(0xab),
             from: DEV_ADDRESS,
-            to: DEV_ADDRESS_1,
+            // Creation now uses None; an existing transfer keeps its destination.
+            to: Some(DEV_ADDRESS_1),
+            input: Bytes::new(),
             value,
             nonce,
             gas: TRANSFER_GAS,
@@ -407,5 +435,31 @@ mod tests {
         assert_eq!(db.accounts[&DEV_ADDRESS].balance, start - one_eth());
         assert_eq!(db.accounts[&DEV_ADDRESS].nonce, 1);
         assert_eq!(db.accounts[&DEV_ADDRESS_1].balance, one_eth());
+    }
+
+    #[test]
+    fn a_contract_call_that_cannot_fit_is_left_unexecuted() {
+        let miner = Address::repeat_byte(0x99);
+        let address = Address::repeat_byte(0x55);
+        let mut db = funded(one_eth() * U256::from(10));
+        let mut contract = Account::default();
+        contract.set_code("0x5b600056".parse().unwrap()); // Infinite loop: burn all gas.
+        db.accounts.insert(address, contract);
+        // Rebuild the code cache after installing the test fixture.
+        let db = BreejaDb::new(db.accounts, HashMap::new());
+        let mut first = transfer(U256::ZERO, 0);
+        first.to = Some(address);
+        first.gas = 2_000_000;
+        let mut second = first.clone();
+        second.nonce = 1;
+        second.hash = B256::repeat_byte(0xcd);
+
+        let execution = execute_block(db, &[first, second], &candidate(miner));
+
+        assert_eq!(execution.gas_used, 2_000_000);
+        assert!(execution.gas_used <= BLOCK_GAS_LIMIT);
+        assert_eq!(execution.transactions.len(), 1);
+        assert_eq!(execution.receipts[0].status, 0);
+        assert_eq!(execution.accounts[&DEV_ADDRESS].nonce, 1);
     }
 }

@@ -118,6 +118,9 @@ fn run(chain: Chain) {
         }
         for receipt in &mut receipts {
             receipt.block_hash = block.hash;
+            for log in &mut receipt.logs {
+                log.block_hash = block.hash;
+            }
         }
 
         // commit, holding the write lock for as little as possible

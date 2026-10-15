@@ -6,13 +6,30 @@
 
 use std::{collections::HashMap, convert::Infallible};
 
-use alloy::primitives::{Address, B256, U256, keccak256};
+use alloy::primitives::{Address, B256, TxKind, U256, keccak256};
 use primitives::node::{Account, BlockState};
 use revm::{
     Database, DatabaseCommit,
+    context_interface::cfg::GasParams,
     primitives::{AddressMap, StorageKey, StorageValue},
+    primitives::{eip3860, hardfork::SpecId},
     state::{Account as RevmAccount, AccountInfo, Bytecode},
 };
+
+pub const EVM_SPEC: SpecId = SpecId::SHANGHAI;
+
+/// Shanghai's up-front gas cost for a legacy call or creation transaction.
+pub fn intrinsic_gas(kind: TxKind, input: &[u8]) -> Result<u64, anyhow::Error> {
+    if kind.is_create() && input.len() > eip3860::MAX_INITCODE_SIZE {
+        anyhow::bail!(
+            "initcode exceeds Shanghai's {} byte limit",
+            eip3860::MAX_INITCODE_SIZE
+        );
+    }
+    Ok(GasParams::new_spec(EVM_SPEC)
+        .initial_tx_gas(input, kind.is_create(), 0, 0, 0, None)
+        .initial_total_gas())
+}
 
 /// A private working copy of accounts, analyzed code, and recent block hashes.
 #[derive(Debug, Clone, Default)]

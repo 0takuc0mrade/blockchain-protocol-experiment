@@ -290,7 +290,38 @@ I recorded this live transfer evidence:
 | Recipient balance | 10,001 ETH |
 | Supply at block 14 | Exactly 40,000 ETH genesis + 14 × 5 ETH rewards |
 
-I have completed M2's acceptance checks. M3–M6 remain pending: contract admission,
-deployment/log receipts, RPC simulation and inspection, and the final variable-gas
-block selection, storage-root and bloom work. The current pool batch size still
-assumes transfer costs; cumulative variable-gas enforcement belongs to M6.
+I completed M2 at checkpoint `94474fc`. The remaining work at that point was
+contracts, RPC simulation and inspection, and the final storage-root/bloom checks.
+
+## M3: contract deployment, calls and failed execution
+
+I changed transaction destinations to `Option<Address>`: `None` means creation,
+while `Some(address)` means a call or transfer. I carry initcode/calldata from
+signature decoding through the mempool into REVM and the mined transaction.
+Receipts now retain the created address and logs, including address, topics,
+data and block/transaction/log positions. I stamp each log's block hash after
+mining and render creation destinations as JSON `null`. I also corrected the
+receipt's JSON spelling to `cumulativeGasUsed`.
+
+I removed the blanket creation/calldata rejections. For admission I reuse REVM's
+Shanghai intrinsic-gas rules, including calldata bytes, creation overhead and
+initcode-word metering, and reject oversized initcode and gas limits above a
+block's capacity. This part of the M6 gas work is needed as soon as contracts
+are admitted. I also check cost addition for overflow.
+
+I added a conservative block guard: a transaction must have its declared gas
+limit available in the remaining block budget before execution. Its actual
+charged gas reduces the budget afterward. A transaction that does not fit stays
+pending. The final M6 block-packing verification remains to be completed.
+
+I verified that a revert is still mined and charged, advances the nonce, and
+rolls back ETH value, storage writes and emitted logs. A separate infinite-loop
+contract proves that out of gas is mined with status zero and consumes the full
+declared limit. I extended signing helpers for deployments and contract calls.
+
+My M3 suite passed **75 tests**, including the brief's raw-bytecode deployment,
+storage/log call, revert, unchanged supply-conservation test, and real-server RPC
+checks for deployment receipts and log metadata. Topic/data preservation and gas
+admission also have regression checks. Release build and warning-free Clippy
+passed. RPC simulation remains M4; inspection methods
+remain M5. Storage roots and log blooms remain unfinished M6 work.
