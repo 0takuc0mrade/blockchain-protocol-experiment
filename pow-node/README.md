@@ -1,14 +1,14 @@
-# Breeja — a proof-of-work Ethereum node with no EVM
+# Breeja — a proof-of-work Ethereum teaching node with REVM
 
 Breeja is a teaching implementation of an Ethereum execution node from the
 proof-of-work era, written in Rust. It mines blocks, validates signed
-transactions, maintains account state, and serves the Ethereum JSON-RPC API.
+transactions, executes contracts with REVM, maintains account state, and serves
+the Ethereum JSON-RPC API.
 
-That omission is the point of the exercise. Ethereum is usually taught EVM-first,
-as though the virtual machine were the whole system. Take the EVM out and what
-remains is still recognisably Ethereum: accounts, nonces, gas, signatures, a
-mempool, proof of work, a difficulty target, blocks linked by hash, and it fits
-in a few hundred lines you can read in an afternoon.
+Breeja began with transfers and no virtual machine. The final project integrates
+REVM into that existing node, preserving its proof of work and account/signature
+plumbing. It deliberately combines Shanghai execution with teaching consensus
+rules, including a 5 ETH block reward; this is not a historical Ethereum network.
 
 ```text
                    eth_sendRawTransaction
@@ -29,7 +29,7 @@ in a few hundred lines you can read in an afternoon.
                  │  miner loop            crates/node/miner.rs  │
                  │                                              │
                  │  1. snapshot state and mempool               │
-                 │  2. execute transfers      → executor.rs     │
+                 │  2. execute with REVM      → executor.rs     │
                  │  3. hash until the nonce works → pow.rs      │
                  │  4. commit the sealed block                  │
                  │  5. retarget difficulty                      │
@@ -125,21 +125,53 @@ The same eleven methods from the assignment, now backed by real state.
 | `eth_getTransactionReceipt` | Receipts for mined transactions; `null` while pending |
 | `eth_getBalance` | Balance at any historical block, or `pending` |
 | `eth_getTransactionCount` | Nonce; `pending` includes queued transactions |
-| `eth_sendRawTransaction` | Validates and queues a signed transfer |
-| `eth_call` | `0x` for a plain transfer; **error** if it needs the EVM |
-| `eth_estimateGas` | `0x5208` (21000); **error** if it needs the EVM |
+| `eth_sendRawTransaction` | Validates and queues a signed legacy transfer, deployment, or call |
+| `eth_call` | Executes against the selected state and returns bytes without committing changes |
+| `eth_estimateGas` | Searches copied state for a sufficient gas limit; `0x5208` for an ordinary transfer |
 
 Anything else returns `-32601 Method not found`.
 
+## Contracts and simulation
+
+M0–M4 are implemented. A legacy transaction with no `to` deploys its initcode;
+contract calls carry calldata. Receipts report `contractAddress`, logs and actual
+gas. Reverts and out-of-gas executions are mined with `status: "0x0"`: the nonce
+advances and gas is charged, while the attempted contract changes roll back.
+
+`eth_call` accepts hypothetical unfunded or contract callers and does not require
+a valid sender nonce. Its default gas price is zero. `eth_estimateGas` defaults
+to 1 gwei and limits the search by a supplied sender's available funds, the block
+limit and any supplied gas cap. Reverts return JSON-RPC error code 3 with raw
+revert data. `data` and `input` are aliases and must match if both are provided.
+
+Historical tags select historical state and block fields. `pending` simulation
+uses the committed head, with queued spending reserved for estimation; it does
+not execute a pending-state overlay. Gas estimates are sufficient for the probed
+snapshot, and can change if state or transaction parameters change. Binary search
+is a heuristic for contracts whose behavior depends on remaining gas.
+
+The real-miner and real-RPC integration tests exercise these paths:
+
+```bash
+cargo test -p node --test contracts
+cargo test -p rpc --test json_rpc
+```
+
+M5's `eth_getCode`, `eth_getStorageAt`, `eth_getLogs` and recommended `eth_gasPrice`
+remain pending. M6's final block-packing checks, storage-root commitments and real
+log blooms also remain pending. The Solidity demo and final write-up are still
+required by [FINAL-PROJECT.md](./FINAL-PROJECT.md).
+
 ## Chain parameters
 
-Deliberately Frontier-era, in `crates/primitives/src/constants.rs`:
+Teaching consensus parameters in `crates/primitives/src/constants.rs`, with
+Shanghai execution rules:
 
 | Parameter | Value | Note |
 | --- | --- | --- |
 | Chain ID | 1 | |
 | Gas price | 1 gwei, fixed | No fee market; no EIP-1559 |
-| Transfer cost | 21,000 gas | The only cost there is |
+| Transfer cost | 21,000 gas | Ordinary ETH transfer; contract gas varies |
 | Block gas limit | 3,141,592 | Frontier's "pi million" — 149 transfers per block |
 | Block reward | 5 ETH | As on Frontier and Homestead |
 | Target block time | 15s (2s with `--dev`) | |

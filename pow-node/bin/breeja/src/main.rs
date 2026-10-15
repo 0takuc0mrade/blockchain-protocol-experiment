@@ -1,4 +1,4 @@
-//! Breeja: a proof-of-work Ethereum node without an EVM.
+//! Breeja: a proof-of-work Ethereum teaching node with REVM execution.
 //!
 //! Starting the node does three things: build the genesis state, start the miner
 //! on its own thread, and start the JSON-RPC server. From then on the miner
@@ -45,7 +45,7 @@ impl Default for Options {
 }
 
 const USAGE: &str = "\
-breeja - a proof-of-work Ethereum node without an EVM
+breeja - a proof-of-work Ethereum teaching node with REVM
 
 USAGE:
     breeja [OPTIONS]

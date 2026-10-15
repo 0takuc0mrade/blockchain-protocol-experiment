@@ -10,8 +10,10 @@ use primitives::{
 use revm::{
     Context, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext,
     context::{BlockEnv, CfgEnv, TxEnv},
-    context_interface::result::ExecutionResult,
+    context_interface::result::ResultAndState,
 };
+
+pub use revm::context_interface::result::ExecutionResult;
 
 use crate::evm::{BreejaDb, EVM_SPEC};
 
@@ -37,6 +39,37 @@ pub fn execute_transaction(
     tx: &PendingTransaction,
     block: &Block,
 ) -> Result<ExecutionResult, anyhow::Error> {
+    let cfg = CfgEnv::new_with_spec(EVM_SPEC).with_chain_id(CHAIN_ID);
+    let outcome = run_transaction(db, tx, block, cfg)?;
+    db.commit(outcome.state);
+    Ok(outcome.result)
+}
+
+/// Executes an unsigned RPC request without persisting any returned changes.
+pub fn simulate_transaction(
+    db: &BreejaDb,
+    tx: &PendingTransaction,
+    block: &Block,
+) -> Result<ExecutionResult, anyhow::Error> {
+    // Hypothetical callers may be unfunded or contracts, and RPC nonce checks
+    // must not prevent inspection. Mining uses the strict configuration above.
+    let mut cfg = CfgEnv::new_with_spec(EVM_SPEC).with_chain_id(CHAIN_ID);
+    cfg.disable_nonce_check = true;
+    cfg.disable_balance_check = true;
+    cfg.disable_eip3607 = true;
+    tx.value
+        .checked_add(U256::from(tx.gas) * U256::from(tx.gas_price))
+        .ok_or_else(|| anyhow::anyhow!("transaction cost overflows a U256"))?;
+    let mut snapshot = db.clone();
+    Ok(run_transaction(&mut snapshot, tx, block, cfg)?.result)
+}
+
+fn run_transaction(
+    db: &mut BreejaDb,
+    tx: &PendingTransaction,
+    block: &Block,
+    cfg: CfgEnv,
+) -> Result<ResultAndState, anyhow::Error> {
     let block_env = BlockEnv {
         number: U256::from(block.number),
         beneficiary: block.miner,
@@ -49,7 +82,6 @@ pub fn execute_transaction(
         prevrandao: Some(block.parent_hash),
         ..Default::default()
     };
-    let cfg = CfgEnv::new_with_spec(EVM_SPEC).with_chain_id(CHAIN_ID);
     let tx_env = TxEnv {
         tx_type: 0,
         caller: tx.from,
@@ -74,8 +106,7 @@ pub fn execute_transaction(
 
     // Release REVM's mutable database borrow before applying its returned state.
     drop(evm);
-    db.commit(outcome.state);
-    Ok(outcome.result)
+    Ok(outcome)
 }
 
 /// Pays the miner for sealing a block.
@@ -461,5 +492,30 @@ mod tests {
         assert_eq!(execution.transactions.len(), 1);
         assert_eq!(execution.receipts[0].status, 0);
         assert_eq!(execution.accounts[&DEV_ADDRESS].nonce, 1);
+    }
+
+    #[test]
+    fn simulation_allows_hypothetical_callers_without_committing_any_state() {
+        let miner = Address::repeat_byte(0x99);
+        let address = Address::repeat_byte(0x55);
+        let mut db = funded(U256::ZERO);
+        let mut contract = Account::default();
+        contract.set_code("0x602a600055602a60005260206000f3".parse().unwrap());
+        db.accounts.insert(address, contract);
+        let mut db = BreejaDb::new(db.accounts, HashMap::new());
+        let before = db.accounts.clone();
+        let mut tx = transfer(one_eth(), 99);
+        tx.to = Some(address);
+        tx.gas = 100_000;
+
+        let result = simulate_transaction(&db, &tx, &candidate(miner)).unwrap();
+        assert!(result.is_success());
+        assert_eq!(
+            result.output().unwrap().as_ref(),
+            U256::from(42).to_be_bytes::<32>()
+        );
+        assert_eq!(db.accounts, before);
+        assert!(execute_transaction(&mut db, &tx, &candidate(miner)).is_err());
+        assert_eq!(db.accounts, before);
     }
 }

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use jsonrpsee::{
     core::client::ClientT,
     http_client::{HttpClient, HttpClientBuilder},
@@ -8,7 +8,10 @@ use jsonrpsee::{
 };
 use node::{
     Chain, ChainConfig, miner,
-    testing::{DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, address_of, one_eth, sign_transfer},
+    testing::{
+        DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, address_of, initcode_for_runtime, one_eth,
+        sign_contract_call, sign_deployment, sign_transfer,
+    },
 };
 use primitives::node::BreejaGenesis;
 use rpc::{RPCContext, start_server};
@@ -64,14 +67,61 @@ impl Harness {
         }
         panic!("timed out waiting for {label}");
     }
+
+    async fn submit(&self, raw: Bytes) -> Value {
+        let hash: String = self
+            .client
+            .request("eth_sendRawTransaction", rpc_params![raw.to_string()])
+            .await
+            .unwrap();
+        self.wait_for("receipt", |chain| {
+            chain.read().get_receipt(&hash.parse().unwrap()).is_some()
+        })
+        .await;
+        self.client
+            .request("eth_getTransactionReceipt", rpc_params![hash])
+            .await
+            .unwrap()
+    }
+
+    async fn deploy_runtime(&self, runtime: &[u8]) -> (Address, Value) {
+        let nonce = self
+            .chain
+            .read()
+            .get_pending_nonce(&address_of(DEV_PRIVATE_KEY).unwrap());
+        let receipt = self
+            .submit(
+                sign_deployment(
+                    DEV_PRIVATE_KEY,
+                    initcode_for_runtime(runtime),
+                    nonce,
+                    150_000,
+                )
+                .unwrap(),
+            )
+            .await;
+        assert_eq!(receipt["status"], "0x1");
+        (
+            receipt["contractAddress"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
+            receipt,
+        )
+    }
+
+    fn stop_mining(&mut self) {
+        self.chain.shutdown();
+        if let Some(handle) = self.miner.take() {
+            handle.join().unwrap();
+        }
+    }
 }
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        self.chain.shutdown();
-        if let Some(handle) = self.miner.take() {
-            let _ = handle.join();
-        }
+        self.stop_mining();
     }
 }
 
@@ -458,10 +508,10 @@ async fn eth_send_raw_transaction_rejects_what_the_node_cannot_execute() {
 }
 
 #[tokio::test]
-async fn eth_call_answers_transfers_and_refuses_anything_needing_the_evm() {
+async fn eth_call_executes_transfers_and_calldata_to_empty_accounts() {
     let harness = Harness::start(&[], false).await;
 
-    // A call with no calldata invokes no code, so it returns no data.
+    // Calling an empty account with no calldata returns no data.
     let result: String = harness
         .client
         .request(
@@ -486,9 +536,9 @@ async fn eth_call_answers_transfers_and_refuses_anything_needing_the_evm() {
         .unwrap();
     assert_eq!(result, "0x");
 
-    // Calldata would need an interpreter, so this is an honest error rather than a
-    // fabricated return value.
-    let result: Result<String, _> = harness
+    // The old no-EVM rejection was correct before integration. An EOA call with
+    // calldata now executes successfully and returns empty output.
+    let result: String = harness
         .client
         .request(
             "eth_call",
@@ -497,9 +547,9 @@ async fn eth_call_answers_transfers_and_refuses_anything_needing_the_evm() {
                 "latest"
             ],
         )
-        .await;
-    let error = result.expect_err("a contract call must be refused");
-    assert!(error.to_string().contains("no EVM"), "got: {error}");
+        .await
+        .unwrap();
+    assert_eq!(result, "0x");
 }
 
 #[tokio::test]
@@ -521,15 +571,17 @@ async fn eth_estimate_gas_returns_the_intrinsic_cost_of_a_transfer() {
         .unwrap();
     assert_eq!(estimate, "0x5208", "21000 gas");
 
-    // Contract creation has no `to` and needs the EVM.
-    let result: Result<String, _> = harness
+    // The old creation rejection reflected the missing interpreter. REVM can
+    // now estimate valid initcode, even when it deploys empty runtime code.
+    let result: String = harness
         .client
         .request(
             "eth_estimateGas",
             rpc_params![serde_json::json!({"from": alice, "data": "0x6080604052"})],
         )
-        .await;
-    assert!(result.is_err());
+        .await
+        .unwrap();
+    assert!(from_quantity(&result) > 53_000);
 }
 
 #[tokio::test]
@@ -645,4 +697,387 @@ async fn deployment_and_contract_logs_are_reported_over_rpc() {
     assert_eq!(log["data"], "0x");
     assert_eq!(log["topics"], serde_json::json!([]));
     assert_eq!(log["removed"], false);
+}
+
+#[tokio::test]
+async fn eth_call_returns_output_without_changing_any_chain_state() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let mut harness = Harness::start(&[(alice, one_eth() * U256::from(100))], true).await;
+    let runtime: Bytes = "0x602a600055602a60005260206000f3".parse().unwrap();
+    let (address, _) = harness.deploy_runtime(&runtime).await;
+    harness.stop_mining();
+    let before = harness.chain.read().accounts_snapshot();
+    let height = harness.chain.read().get_block_number();
+    let expected = format!("0x{:064x}", 42);
+
+    let result: String = harness
+        .client
+        .request(
+            "eth_call",
+            rpc_params![serde_json::json!({
+                "from": Address::repeat_byte(0x77), "to": address,
+                "value": "0xde0b6b3a7640000", "nonce": "0x63"
+            })],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, expected);
+    // A contract can be a hypothetical caller even though it cannot sign a tx.
+    let result: String = harness
+        .client
+        .request(
+            "eth_call",
+            rpc_params![serde_json::json!({
+                "from": address, "to": address, "nonce": "0x63"
+            })],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, expected);
+    let state = harness.chain.read();
+    assert_eq!(state.accounts_snapshot(), before);
+    assert_eq!(state.get_block_number(), height);
+    assert_eq!(state.mempool_len(), 0);
+    assert_eq!(state.get_storage(&address, U256::ZERO), U256::ZERO);
+}
+
+#[tokio::test]
+async fn gas_estimates_are_sufficient_for_deployment_and_contract_calls() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth() * U256::from(100))], true).await;
+    let runtime: Bytes = "0x602a600055602a60005260206000f3".parse().unwrap();
+    let initcode = initcode_for_runtime(&runtime);
+    let estimate: String = harness
+        .client
+        .request(
+            "eth_estimateGas",
+            rpc_params![serde_json::json!({
+                "from": alice, "input": initcode
+            })],
+        )
+        .await
+        .unwrap();
+    let gas = u64::try_from(from_quantity(&estimate)).unwrap();
+    assert!(gas > 53_000 && gas < 100_000);
+    let receipt = harness
+        .submit(sign_deployment(DEV_PRIVATE_KEY, initcode, 0, gas).unwrap())
+        .await;
+    assert_eq!(receipt["status"], "0x1");
+    let address: Address = receipt["contractAddress"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(harness.chain.read().get_code(&address), runtime);
+
+    let starved: Result<String, _> = harness
+        .client
+        .request(
+            "eth_estimateGas",
+            rpc_params![serde_json::json!({
+                "from": alice, "to": address, "gas": "0x5208"
+            })],
+        )
+        .await;
+    assert!(starved.is_err());
+    let estimate: String = harness
+        .client
+        .request(
+            "eth_estimateGas",
+            rpc_params![serde_json::json!({
+                "from": alice, "to": address
+            })],
+        )
+        .await
+        .unwrap();
+    let gas = u64::try_from(from_quantity(&estimate)).unwrap();
+    assert!(gas > 43_000 && gas < 50_000);
+    assert_eq!(
+        harness.chain.read().get_storage(&address, U256::ZERO),
+        U256::ZERO
+    );
+    assert_eq!(harness.chain.read().get_account(&alice).nonce, 1);
+    let receipt = harness
+        .submit(
+            sign_contract_call(DEV_PRIVATE_KEY, address, U256::ZERO, Bytes::new(), 1, gas).unwrap(),
+        )
+        .await;
+    assert_eq!(receipt["status"], "0x1");
+    assert!(from_quantity(receipt["gasUsed"].as_str().unwrap()) <= u128::from(gas));
+    assert_eq!(
+        harness.chain.read().get_storage(&address, U256::ZERO),
+        U256::from(42)
+    );
+}
+
+#[tokio::test]
+async fn estimation_searches_for_a_sufficient_limit_instead_of_using_refunded_gas() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth() * U256::from(100))], true).await;
+    // Set a slot and clear it again: the refund lowers the charged gas, but the
+    // transaction still needs enough gas to reach the second SSTORE.
+    let runtime: Bytes = "0x6001600055600060005500".parse().unwrap();
+    let (address, _) = harness.deploy_runtime(&runtime).await;
+    let estimate: String = harness
+        .client
+        .request(
+            "eth_estimateGas",
+            rpc_params![serde_json::json!({
+                "from": alice, "to": address
+            })],
+        )
+        .await
+        .unwrap();
+    let gas = u64::try_from(from_quantity(&estimate)).unwrap();
+    let receipt = harness
+        .submit(
+            sign_contract_call(DEV_PRIVATE_KEY, address, U256::ZERO, Bytes::new(), 1, gas).unwrap(),
+        )
+        .await;
+    assert_eq!(receipt["status"], "0x1");
+    assert!(u128::from(gas) > from_quantity(receipt["gasUsed"].as_str().unwrap()));
+    assert_eq!(
+        harness.chain.read().get_storage(&address, U256::ZERO),
+        U256::ZERO
+    );
+}
+
+#[tokio::test]
+async fn eth_call_uses_the_requested_historical_code_and_storage() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth() * U256::from(100))], true).await;
+    // Empty calldata reads slot 0; non-empty calldata writes its first word.
+    let runtime: Bytes = "0x3615600c57600035600055005b60005460005260206000f3"
+        .parse()
+        .unwrap();
+    let (address, deployment) = harness.deploy_runtime(&runtime).await;
+    let input = Bytes::from(U256::from(7).to_be_bytes::<32>().to_vec());
+    let receipt = harness
+        .submit(
+            sign_contract_call(DEV_PRIVATE_KEY, address, U256::ZERO, input, 1, 100_000).unwrap(),
+        )
+        .await;
+    assert_eq!(receipt["status"], "0x1");
+    let latest: String = harness
+        .client
+        .request(
+            "eth_call",
+            rpc_params![serde_json::json!({"to": address}), "latest"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest, format!("0x{:064x}", 7));
+    let historical: String = harness
+        .client
+        .request(
+            "eth_call",
+            rpc_params![
+                serde_json::json!({"to": address}),
+                deployment["blockNumber"].as_str().unwrap()
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical, format!("0x{:064x}", 0));
+    let genesis: String = harness
+        .client
+        .request(
+            "eth_call",
+            rpc_params![serde_json::json!({"to": address}), "earliest"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(genesis, "0x");
+}
+
+#[tokio::test]
+async fn simulation_uses_the_selected_block_environment_and_ancestor_hashes() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth() * U256::from(100))], true).await;
+    // Return NUMBER, TIMESTAMP, PREVRANDAO and BLOCKHASH(calldata[0]).
+    let runtime: Bytes = "0x4360005242602052446040526000354060605260806000f3"
+        .parse()
+        .unwrap();
+    let (address, receipt) = harness.deploy_runtime(&runtime).await;
+    let tag = receipt["blockNumber"].as_str().unwrap();
+    let block: Value = harness
+        .client
+        .request("eth_getBlockByNumber", rpc_params![tag, false])
+        .await
+        .unwrap();
+    let number = from_quantity(tag);
+    let input = Bytes::from(U256::from(number - 1).to_be_bytes::<32>().to_vec());
+    let output: Bytes = harness
+        .client
+        .request(
+            "eth_call",
+            rpc_params![serde_json::json!({"to": address, "data": input}), tag],
+        )
+        .await
+        .unwrap();
+    let parent: B256 = block["parentHash"].as_str().unwrap().parse().unwrap();
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&U256::from(number).to_be_bytes::<32>());
+    expected.extend_from_slice(
+        &U256::from(from_quantity(block["timestamp"].as_str().unwrap())).to_be_bytes::<32>(),
+    );
+    expected.extend_from_slice(parent.as_slice());
+    expected.extend_from_slice(parent.as_slice());
+    assert_eq!(output.as_ref(), expected);
+
+    let input = Bytes::from(U256::from(number).to_be_bytes::<32>().to_vec());
+    let output: Bytes = harness
+        .client
+        .request(
+            "eth_call",
+            rpc_params![serde_json::json!({"to": address, "data": input}), tag],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        &output[96..],
+        B256::ZERO.as_slice(),
+        "BLOCKHASH cannot read the current block"
+    );
+}
+
+#[tokio::test]
+async fn simulations_report_revert_data_and_halts_as_errors() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth() * U256::from(100))], true).await;
+    let runtime: Bytes = "0x63deadbeef6000526004601cfd".parse().unwrap();
+    let (address, _) = harness.deploy_runtime(&runtime).await;
+    for method in ["eth_call", "eth_estimateGas"] {
+        let result: Result<String, _> = harness
+            .client
+            .request(
+                method,
+                rpc_params![serde_json::json!({"from": alice, "to": address})],
+            )
+            .await;
+        match result.unwrap_err() {
+            jsonrpsee::core::client::Error::Call(error) => {
+                assert_eq!(error.code(), 3);
+                assert_eq!(error.message(), "execution reverted");
+                assert_eq!(error.data().unwrap().get(), "\"0xdeadbeef\"");
+            }
+            error => panic!("unexpected transport error: {error}"),
+        }
+    }
+    let runtime: Bytes = "0x5b600056".parse().unwrap();
+    let (address, _) = harness.deploy_runtime(&runtime).await;
+    let result: Result<String, _> = harness
+        .client
+        .request(
+            "eth_call",
+            rpc_params![serde_json::json!({"to": address, "gas": "0x7530"})],
+        )
+        .await;
+    assert!(result.unwrap_err().to_string().contains("execution halted"));
+}
+
+#[tokio::test]
+async fn simulation_rejects_invalid_fields_and_unknown_blocks() {
+    let harness = Harness::start(&[], false).await;
+    let address = Address::repeat_byte(0x22);
+    let too_wide = format!("{:#x}", U256::MAX);
+    for request in [
+        serde_json::json!({"to": address, "gas": too_wide}),
+        serde_json::json!({"to": address, "gasPrice": too_wide}),
+        serde_json::json!({"to": address, "nonce": too_wide}),
+        serde_json::json!({"to": address, "data": "0x00", "input": "0x01"}),
+    ] {
+        for method in ["eth_call", "eth_estimateGas"] {
+            let result: Result<String, _> = harness
+                .client
+                .request(method, rpc_params![request.clone()])
+                .await;
+            match result.unwrap_err() {
+                jsonrpsee::core::client::Error::Call(error) => assert_eq!(error.code(), -32602),
+                error => panic!("unexpected transport error: {error}"),
+            }
+        }
+    }
+    for method in ["eth_call", "eth_estimateGas"] {
+        let result: Result<String, _> = harness
+            .client
+            .request(
+                method,
+                rpc_params![serde_json::json!({"to": address}), "0xffffff"],
+            )
+            .await;
+        assert!(result.is_err());
+    }
+    let overflowing: Result<String, _> = harness
+        .client
+        .request(
+            "eth_estimateGas",
+            rpc_params![serde_json::json!({"to": address, "value": too_wide})],
+        )
+        .await;
+    assert!(overflowing.is_err());
+}
+
+#[tokio::test]
+async fn estimates_respect_affordable_gas_and_pending_reservations() {
+    use primitives::constants::GAS_PRICE;
+
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let balance = U256::from(50_000) * U256::from(GAS_PRICE);
+    let harness = Harness::start(&[(alice, balance)], false).await;
+    let recipient = Address::repeat_byte(0x22);
+    let request = serde_json::json!({"from": alice, "to": recipient});
+    let gas: String = harness
+        .client
+        .request("eth_estimateGas", rpc_params![request.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        gas, "0x5208",
+        "a sender need not afford the entire block gas limit"
+    );
+
+    for nonce in 0..2 {
+        let raw = sign_transfer(DEV_PRIVATE_KEY, recipient, U256::ZERO, nonce).unwrap();
+        let _: String = harness
+            .client
+            .request("eth_sendRawTransaction", rpc_params![raw.to_string()])
+            .await
+            .unwrap();
+    }
+    let pending: Result<String, _> = harness
+        .client
+        .request("eth_estimateGas", rpc_params![request.clone(), "pending"])
+        .await;
+    assert!(
+        pending.is_err(),
+        "pending reservations leave fewer than 21,000 gas affordable"
+    );
+    let latest: String = harness
+        .client
+        .request("eth_estimateGas", rpc_params![request, "latest"])
+        .await
+        .unwrap();
+    assert_eq!(latest, "0x5208");
+    let no_fee_balance: Result<String, _> = harness
+        .client
+        .request(
+            "eth_estimateGas",
+            rpc_params![serde_json::json!({
+                "from": alice, "to": recipient, "value": format!("{balance:#x}")
+            })],
+        )
+        .await;
+    assert!(no_fee_balance.is_err());
+    let anonymous: String = harness
+        .client
+        .request(
+            "eth_estimateGas",
+            rpc_params![serde_json::json!({
+                "to": recipient, "value": "0xde0b6b3a7640000"
+            })],
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous, "0x5208");
 }

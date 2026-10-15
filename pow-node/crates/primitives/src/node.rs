@@ -515,11 +515,22 @@ impl BlockState {
         self.accounts.clone()
     }
 
+    /// A copy of the state after a selected block for historical RPC execution.
+    pub fn accounts_snapshot_at(&self, number: u64) -> Option<HashMap<Address, Account>> {
+        self.state_history.get(number as usize).cloned()
+    }
+
     /// The previous 256 blocks available to the next candidate's BLOCKHASH opcode.
     pub fn block_hashes_snapshot(&self) -> HashMap<u64, B256> {
+        self.block_hashes_before(self.blocks.len() as u64)
+    }
+
+    /// The 256 ancestors visible to execution at `number`, excluding that block.
+    pub fn block_hashes_before(&self, number: u64) -> HashMap<u64, B256> {
         self.blocks
             .iter()
             .rev()
+            .filter(|block| block.number < number)
             .take(256)
             .map(|block| (block.number, block.hash))
             .collect()
@@ -541,8 +552,8 @@ impl BlockState {
         self.mempool.iter().any(|tx| &tx.hash == hash)
     }
 
-    /// The transactions the next block would include: as many as fit in one
-    /// block's gas limit, oldest first.
+    /// Oldest candidates for the next block, bounded by the minimum transaction
+    /// cost. Execution determines which candidates fit the remaining gas budget.
     ///
     /// This does not remove them. The miner may spend a long time failing to seal
     /// a block, and a transaction must stay pending until it is actually mined.
@@ -745,6 +756,29 @@ mod tests {
         );
         assert_eq!(state.get_code_at(&address, 1), Some(code.clone()));
         assert_eq!(state.get_code_at(&address, 2), Some(code));
+    }
+
+    #[test]
+    fn historical_blockhash_snapshots_include_exactly_the_visible_ancestors() {
+        let mut state = BlockState::new_with_gensis(BreejaGenesis::default(), 8);
+        let genesis = state.head().hash;
+        // Synthetic blocks isolate the 256-block lookup boundary from PoW.
+        for number in 1..=257u64 {
+            let mut block = state.head().clone();
+            block.number = number;
+            block.parent_hash = state.head().hash;
+            block.hash = B256::from(U256::from(number));
+            state.commit_block(state.accounts_snapshot(), block, Vec::new(), Vec::new());
+        }
+        let hashes = state.block_hashes_before(257);
+        assert_eq!(hashes.len(), 256);
+        assert!(!hashes.contains_key(&0));
+        assert!(!hashes.contains_key(&257));
+        assert_eq!(hashes.get(&1), Some(&B256::from(U256::from(1))));
+        assert_eq!(hashes.get(&256), Some(&B256::from(U256::from(256))));
+        assert_eq!(state.block_hashes_before(1), HashMap::from([(0, genesis)]));
+        assert!(state.block_hashes_before(0).is_empty());
+        assert!(state.block_hashes_snapshot().contains_key(&257));
     }
 
     #[test]

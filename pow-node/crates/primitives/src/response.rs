@@ -222,8 +222,7 @@ fn block_size(block: &Block) -> u64 {
     HEADER_BYTES + EXTRA_DATA.len() as u64 + block.transactions.len() as u64 * TX_BYTES
 }
 
-/// Gas a plain transfer costs. Returned by `eth_estimateGas`, where it is the
-/// only answer a node without an EVM can give.
+/// Intrinsic gas baseline for an ordinary ETH transfer.
 pub const TRANSFER_GAS_ESTIMATE: u64 = TRANSFER_GAS;
 
 #[cfg(test)]

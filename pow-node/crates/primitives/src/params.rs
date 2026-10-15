@@ -71,6 +71,7 @@ impl<'de> Deserialize<'de> for BlockTag {
 pub struct CallRequest {
     pub from: Option<Address>,
     pub to: Option<Address>,
+    pub nonce: Option<U256>,
     pub gas: Option<U256>,
     pub gas_price: Option<U256>,
     pub value: Option<U256>,
@@ -80,19 +81,17 @@ pub struct CallRequest {
 
 impl CallRequest {
     /// The calldata this request carries, under whichever name it was sent.
-    ///
-    /// Breeja uses this to decide whether it can answer at all: calldata means
-    /// contract code, and there is no EVM to run it.
-    pub fn calldata(&self) -> Bytes {
-        self.data
+    pub fn calldata(&self) -> Result<Bytes, anyhow::Error> {
+        if let (Some(data), Some(input)) = (&self.data, &self.input)
+            && data != input
+        {
+            anyhow::bail!("data and input must agree when both are supplied");
+        }
+        Ok(self
+            .data
             .clone()
             .or_else(|| self.input.clone())
-            .unwrap_or_default()
-    }
-
-    /// Whether this request needs an EVM to answer.
-    pub fn needs_evm(&self) -> bool {
-        !self.calldata().is_empty() || self.to.is_none()
+            .unwrap_or_default())
     }
 }
 
@@ -123,22 +122,19 @@ mod tests {
     }
 
     #[test]
-    fn a_call_needs_an_evm_when_it_carries_calldata_or_creates_a_contract() {
-        let transfer = CallRequest {
-            to: Some(Address::ZERO),
+    fn calldata_aliases_agree_and_conflicting_values_are_rejected() {
+        // The old needs_evm test assumed empty calldata never executes code.
+        // Contracts can run with empty calldata, so all calls now use the VM.
+        let bytes = Bytes::from_static(&[0xde, 0xad]);
+        assert_eq!(CallRequest::default().calldata().unwrap(), Bytes::new());
+        let mut request = CallRequest {
+            input: Some(bytes.clone()),
             ..Default::default()
         };
-        assert!(!transfer.needs_evm());
-
-        let contract_call = CallRequest {
-            to: Some(Address::ZERO),
-            data: Some(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])),
-            ..Default::default()
-        };
-        assert!(contract_call.needs_evm());
-
-        // No `to` at all is a contract deployment.
-        let deployment = CallRequest::default();
-        assert!(deployment.needs_evm());
+        assert_eq!(request.calldata().unwrap(), bytes);
+        request.data = Some(bytes.clone());
+        assert_eq!(request.calldata().unwrap(), bytes);
+        request.input = Some(Bytes::new());
+        assert!(request.calldata().is_err());
     }
 }
