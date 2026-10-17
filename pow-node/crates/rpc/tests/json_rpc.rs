@@ -131,6 +131,205 @@ fn from_quantity(raw: &str) -> u128 {
 }
 
 #[tokio::test]
+async fn code_and_storage_queries_use_historical_snapshots_and_fixed_width_data() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let mut harness = Harness::start(&[(alice, one_eth())], true).await;
+    let runtime: Bytes = "0x602a60005500".parse().unwrap();
+    let (address, deployment) = harness.deploy_runtime(&runtime).await;
+    let nonce = harness.chain.read().get_pending_nonce(&alice);
+    let receipt = harness
+        .submit(
+            sign_contract_call(
+                DEV_PRIVATE_KEY,
+                address,
+                U256::ZERO,
+                Bytes::new(),
+                nonce,
+                100_000,
+            )
+            .unwrap(),
+        )
+        .await;
+    harness.stop_mining();
+
+    for (who, tag, expected) in [
+        (address, "latest", runtime.to_string()),
+        (address, "earliest", "0x".to_owned()),
+        (alice, "latest", "0x".to_owned()),
+        (Address::ZERO, "latest", "0x".to_owned()),
+    ] {
+        let code: String = harness
+            .client
+            .request("eth_getCode", rpc_params![who, tag])
+            .await
+            .unwrap();
+        assert_eq!(code, expected);
+    }
+    for (who, slot, tag, expected) in [
+        (address, U256::ZERO, "latest", 42),
+        (
+            address,
+            U256::ZERO,
+            deployment["blockNumber"].as_str().unwrap(),
+            0,
+        ),
+        (address, U256::MAX, "latest", 0),
+        (Address::ZERO, U256::ZERO, "latest", 0),
+    ] {
+        let value: String = harness
+            .client
+            .request("eth_getStorageAt", rpc_params![who, slot, tag])
+            .await
+            .unwrap();
+        assert_eq!(value, format!("0x{expected:064x}"));
+        assert_eq!(value.len(), 66);
+    }
+    let value: String = harness
+        .client
+        .request(
+            "eth_getStorageAt",
+            rpc_params![address, "0x0", &receipt["blockNumber"]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(value, format!("0x{:064x}", 42));
+    let error = harness
+        .client
+        .request::<Value, _>("eth_getStorageAt", rpc_params![address, "-1", "latest"])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, jsonrpsee::core::client::Error::Call(ref error) if error.code() == -32602)
+    );
+    assert!(
+        harness
+            .client
+            .request::<Value, _>("eth_getCode", rpc_params![address, "0xffffffffffffffff"])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn logs_filter_range_addresses_and_positional_topic_alternatives() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let mut harness = Harness::start(&[(alice, one_eth())], true).await;
+    // LOG2: first topic aa, second topic bb, data is the word 42.
+    let runtime: Bytes = "0x602a60005260bb60aa60206000a200".parse().unwrap();
+    let (first, _) = harness.deploy_runtime(&runtime).await;
+    let (second, _) = harness.deploy_runtime(&runtime).await;
+    let mut receipts = Vec::new();
+    for address in [first, second, first] {
+        let nonce = harness.chain.read().get_pending_nonce(&alice);
+        receipts.push(
+            harness
+                .submit(
+                    sign_contract_call(
+                        DEV_PRIVATE_KEY,
+                        address,
+                        U256::ZERO,
+                        Bytes::new(),
+                        nonce,
+                        100_000,
+                    )
+                    .unwrap(),
+                )
+                .await,
+        );
+    }
+    harness.stop_mining();
+    let aa = format!("0x{:064x}", 0xaa);
+    let bb = format!("0x{:064x}", 0xbb);
+    let cc = format!("0x{:064x}", 0xcc);
+    let base = serde_json::json!({"fromBlock": "earliest", "toBlock": "latest"});
+    let expected: Vec<Value> = receipts.iter().map(|r| r["logs"][0].clone()).collect();
+    for (changes, indices) in [
+        (serde_json::json!({}), vec![0, 1, 2]),
+        (serde_json::json!({"address": first}), vec![0, 2]),
+        (
+            serde_json::json!({"address": [first, second]}),
+            vec![0, 1, 2],
+        ),
+        (serde_json::json!({"address": Address::ZERO}), vec![]),
+        (serde_json::json!({"topics": [aa, bb]}), vec![0, 1, 2]),
+        (
+            serde_json::json!({"topics": [null, [cc, bb]]}),
+            vec![0, 1, 2],
+        ),
+        (
+            serde_json::json!({"topics": [[cc, aa], null]}),
+            vec![0, 1, 2],
+        ),
+        (serde_json::json!({"topics": [bb, aa]}), vec![]),
+        (serde_json::json!({"topics": [aa, cc]}), vec![]),
+        (serde_json::json!({"topics": [null, null, null]}), vec![]),
+        (
+            serde_json::json!({"fromBlock": receipts[1]["blockNumber"], "toBlock": receipts[1]["blockNumber"]}),
+            vec![1],
+        ),
+    ] {
+        let mut filter = base.clone();
+        filter
+            .as_object_mut()
+            .unwrap()
+            .extend(changes.as_object().unwrap().clone());
+        let logs: Vec<Value> = harness
+            .client
+            .request("eth_getLogs", rpc_params![&filter])
+            .await
+            .unwrap();
+        assert_eq!(
+            logs,
+            indices
+                .iter()
+                .map(|&i| expected[i].clone())
+                .collect::<Vec<_>>(),
+            "filter: {filter}"
+        );
+    }
+    let logs: Vec<Value> = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![
+                serde_json::json!({"blockHash": receipts[1]["blockHash"], "address": second})
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(logs, vec![expected[1].clone()]);
+    for filter in [
+        serde_json::json!({"fromBlock": "latest", "toBlock": "earliest"}),
+        serde_json::json!({"toBlock": "0xffffffffffffffff"}),
+        serde_json::json!({"blockHash": receipts[0]["blockHash"], "fromBlock": "earliest"}),
+        serde_json::json!({"topics": [null, null, null, null, null]}),
+        serde_json::json!({"topics": ["0xaa"]}),
+        serde_json::json!({"address": "0xaa"}),
+    ] {
+        let error = harness
+            .client
+            .request::<Value, _>("eth_getLogs", rpc_params![filter])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, jsonrpsee::core::client::Error::Call(ref error) if error.code() == -32602),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gas_price_reports_the_chains_fixed_legacy_price() {
+    let harness = Harness::start(&[], false).await;
+    let price: String = harness
+        .client
+        .request("eth_gasPrice", rpc_params![])
+        .await
+        .unwrap();
+    assert_eq!(from_quantity(&price), primitives::constants::GAS_PRICE);
+}
+
+#[tokio::test]
 async fn eth_chain_id_returns_the_configured_chain_id() {
     let harness = Harness::start(&[], false).await;
     let id: String = harness
@@ -588,9 +787,12 @@ async fn eth_estimate_gas_returns_the_intrinsic_cost_of_a_transfer() {
 async fn an_unsupported_method_gets_the_standard_method_not_found_error() {
     let harness = Harness::start(&[], false).await;
 
-    // `eth_gasPrice` is a real Ethereum method this node does not implement, so it
-    // must come back as -32601 rather than something invented.
-    let result: Result<Value, _> = harness.client.request("eth_gasPrice", rpc_params![]).await;
+    // M5 implements eth_gasPrice; tracing remains unsupported and must still
+    // produce the standard method-not-found error.
+    let result: Result<Value, _> = harness
+        .client
+        .request("debug_traceTransaction", rpc_params![])
+        .await;
     let error = result.expect_err("an unregistered method must be an error");
     assert!(
         error.to_string().contains("Method not found") || error.to_string().contains("-32601"),

@@ -109,7 +109,7 @@ pub struct TransactionReceiptResponse {
 }
 
 /// Ethereum's JSON-RPC form of one mined log.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogResponse {
     pub address: String,

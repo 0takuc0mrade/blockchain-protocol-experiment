@@ -10,10 +10,10 @@ use node::{
 use primitives::{
     constants::{CHAIN_ID, GAS_PRICE},
     node::{Block, BlockState, PendingTransaction},
-    params::{BlockTag, CallRequest},
+    params::{BlockTag, CallRequest, LogFilter},
     response::{
-        BlockResponse, TransactionReceiptResponse, TransactionResponse, data_bytes, data_hash,
-        quantity,
+        BlockResponse, LogResponse, TransactionReceiptResponse, TransactionResponse, data_bytes,
+        data_hash, quantity,
     },
 };
 use serde_json::Value;
@@ -58,6 +58,88 @@ pub fn chain_id_handler() -> String {
 /// block, and climbs from there as the miner seals blocks.
 pub fn block_number_handler(context: &RPCContext) -> String {
     quantity(context.chain.read().get_block_number())
+}
+
+pub fn gas_price_handler(context: &RPCContext) -> String {
+    quantity(context.chain.read().gas_price())
+}
+
+pub fn get_code_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
+    let mut sequence = params.sequence();
+    let address: Address = sequence.next()?;
+    let tag = sequence
+        .optional_next::<BlockTag>()?
+        .unwrap_or(BlockTag::Latest);
+    let state = context.chain.read();
+    let number = resolve_tag(&state, &tag)?;
+    Ok(data_bytes(
+        &state.get_code_at(&address, number).expect("resolved block"),
+    ))
+}
+
+pub fn get_storage_at_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
+    let mut sequence = params.sequence();
+    let address: Address = sequence.next()?;
+    let slot: U256 = sequence.next()?;
+    let tag = sequence
+        .optional_next::<BlockTag>()?
+        .unwrap_or(BlockTag::Latest);
+    let state = context.chain.read();
+    let number = resolve_tag(&state, &tag)?;
+    let value = state
+        .get_storage_at(&address, slot, number)
+        .expect("resolved block");
+    // Storage is DATA, not a minimal-width QUANTITY, including for zero.
+    Ok(format!("0x{value:064x}"))
+}
+
+pub fn get_logs_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<Vec<LogResponse>> {
+    let filter: LogFilter = params.one()?;
+    if filter
+        .topics
+        .as_ref()
+        .is_some_and(|topics| topics.len() > 4)
+    {
+        return Err(invalid_params("at most four topic positions are allowed"));
+    }
+    let state = context.chain.read();
+    let (from, to) = if let Some(hash) = filter.block_hash {
+        if filter.from_block.is_some() || filter.to_block.is_some() {
+            return Err(invalid_params(
+                "blockHash cannot be combined with fromBlock or toBlock",
+            ));
+        }
+        let number = state
+            .get_block_by_hash(&hash)
+            .ok_or_else(|| invalid_input("unknown block hash"))?
+            .number;
+        (number, number)
+    } else {
+        let head = state.get_block_number();
+        let from = filter
+            .from_block
+            .unwrap_or(BlockTag::Latest)
+            .resolve(head)
+            .map_err(invalid_params)?;
+        let to = filter
+            .to_block
+            .unwrap_or(BlockTag::Latest)
+            .resolve(head)
+            .map_err(invalid_params)?;
+        if from > to {
+            return Err(invalid_params("fromBlock must not exceed toBlock"));
+        }
+        (from, to)
+    };
+    // Traverse canonical block/transaction order, never the receipt HashMap order.
+    Ok((from..=to)
+        .filter_map(|number| state.get_block(number))
+        .flat_map(|block| &block.transactions)
+        .filter_map(|hash| state.get_receipt(hash))
+        .flat_map(|receipt| &receipt.logs)
+        .filter(|log| filter.matches(log))
+        .map(LogResponse::from)
+        .collect())
 }
 
 /// Renders a block, inlining full transaction objects if the caller asked for them.

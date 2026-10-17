@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
 /// Which block a state query refers to.
@@ -92,6 +92,49 @@ impl CallRequest {
             .clone()
             .or_else(|| self.input.clone())
             .unwrap_or_default())
+    }
+}
+
+/// Address/topic alternatives are ORed; separate topic positions are ANDed.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T: PartialEq> OneOrMany<T> {
+    pub fn matches(&self, value: &T) -> bool {
+        match self {
+            Self::One(expected) => expected == value,
+            // Like an omitted filter, an empty alternatives list is a wildcard.
+            Self::Many(values) => values.is_empty() || values.contains(value),
+        }
+    }
+}
+
+/// A mined-log query. A block hash selects one block instead of a range.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogFilter {
+    pub from_block: Option<BlockTag>,
+    pub to_block: Option<BlockTag>,
+    pub block_hash: Option<B256>,
+    pub address: Option<OneOrMany<Address>>,
+    pub topics: Option<Vec<Option<OneOrMany<B256>>>>,
+}
+
+impl LogFilter {
+    pub fn matches(&self, log: &crate::node::Log) -> bool {
+        self.address
+            .as_ref()
+            .is_none_or(|addresses| addresses.matches(&log.address))
+            && self.topics.as_ref().is_none_or(|topics| {
+                topics.len() <= log.topics.len()
+                    && topics.iter().zip(&log.topics).all(|(filter, topic)| {
+                        filter.as_ref().is_none_or(|values| values.matches(topic))
+                    })
+            })
     }
 }
 

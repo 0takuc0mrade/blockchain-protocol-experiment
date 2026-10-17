@@ -2,7 +2,7 @@
 
 I started this project on 14 October 2026 and am following
 [FINAL-PROJECT.md](FINAL-PROJECT.md). This is my working technical write-up through
-M4. I distinguish completed checks from the M5/M6 work still outstanding.
+M5. I distinguish completed checks from the M6 work still outstanding.
 
 ## What I started with
 
@@ -178,6 +178,21 @@ reserves queued spending when that tag is requested. I do not execute a pending
 overlay. Without a supplied sender, I provide a hypothetical estimate without
 claiming that any particular account can afford the eventual transaction.
 
+## M5: inspection RPC
+
+I added historical `eth_getCode` and `eth_getStorageAt`, returning empty code
+and a full 32-byte zero word for missing data. I scan mined receipts in canonical
+block/transaction order for `eth_getLogs`. I support inclusive ranges, one or
+many addresses, positional topic AND, alternatives OR, and `null` wildcards.
+I also accept a block hash instead of a range and reject conflicting or invalid
+filters. I run the scan on a blocking worker.
+
+I added the fixed 1 gwei `eth_gasPrice`. My README `cast send --legacy` command
+worked without supplying gas price, gas limit or nonce: status one, 21,000 gas,
+block 15, hash `0x22d76a11db763d4b5cc16135b4d8ee08acdce86bb84fb87f4a9fd353176bba26`.
+I now test unsupported-method behavior with `debug_traceTransaction`, because
+the old test's `eth_gasPrice` example has become supported.
+
 ## Verification and remaining work
 
 I retained the original test coverage and explain changed no-EVM expectations
@@ -189,10 +204,11 @@ in code comments. My checkpoint evidence is:
 | M1 | 59 passed | `6a85d48` |
 | M2 | 65 passed | `94474fc` |
 | M3 | 75 passed | `30586ef` |
-| M4 | 85 passed | Current milestone |
+| M4 | 85 passed | `7eea765` |
+| M5 | 88 passed | Current milestone |
 
-My M4 suite includes all mining/supply tests, five contract integration tests,
-and 22 real-server RPC tests. I verify whole-account-map equality after
+My suite includes all mining/supply tests, five contract integration tests,
+and 25 real-server RPC tests. I verify whole-account-map equality after
 `eth_call`, historical storage, block fields/hashes, revert data, affordable gas,
 pending reservations, and exact-estimate submission. I run:
 
@@ -203,8 +219,7 @@ pending reservations, and exact-estimate submission. I run:
 All three checks passed. I also checked the updated release CLI help; no tests
 were ignored and Clippy reported no warnings.
 
-M5 remains: `eth_getCode`, `eth_getStorageAt`, `eth_getLogs` and recommended
-`eth_gasPrice`. M6 remains: final block-packing verification, storage-root
+M6 remains: final block-packing verification, storage-root
 commitments and real log blooms. Storage-only changes still do not affect the
 state root, and receipt blooms are still placeholders. I still need the Solidity
 deployment/call demo and final submission review. State remains in memory and

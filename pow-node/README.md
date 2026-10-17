@@ -84,18 +84,13 @@ must never hold real funds.**
 
 ## Sending a transaction
 
-Breeja does not implement `eth_gasPrice`, so `cast send` cannot auto-fill its
-parameters. Build and sign the transaction offline with `cast mktx`, then submit
-the raw bytes.
+Breeja exposes `eth_gasPrice` and `eth_estimateGas`, so `cast send` can fill the
+price, gas limit, and nonce. With the node running:
 
 ```bash
-RAW=$(cast mktx --legacy \
+cast send --legacy --rpc-url http://127.0.0.1:8545 \
   --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-  --nonce 0 --gas-price 1000000000 --gas-limit 21000 --chain 1 \
-  --value 1ether 0x70997970C51812dc3A010C7d01b50e0d17dc79C8)
-
-curl -s -X POST http://localhost:8545 -H 'Content-Type: application/json' \
-  --data "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$RAW\"],\"id\":1}"
+  --value 1ether 0x70997970C51812dc3A010C7d01b50e0d17dc79C8
 ```
 
 `--legacy` is required. Breeja predates EIP-1559 and rejects typed transactions,
@@ -113,7 +108,7 @@ client waits for confirmation.
 
 ## The JSON-RPC API
 
-The same eleven methods from the assignment, now backed by real state.
+The original eleven methods plus the four inspection/tooling methods from M5.
 
 | Method | Behaviour |
 | --- | --- |
@@ -128,12 +123,16 @@ The same eleven methods from the assignment, now backed by real state.
 | `eth_sendRawTransaction` | Validates and queues a signed legacy transfer, deployment, or call |
 | `eth_call` | Executes against the selected state and returns bytes without committing changes |
 | `eth_estimateGas` | Searches copied state for a sufficient gas limit; `0x5208` for an ordinary transfer |
+| `eth_gasPrice` | Fixed legacy gas price, 1 gwei |
+| `eth_getCode` | Runtime bytecode at the selected block, or `0x` |
+| `eth_getStorageAt` | A slot at the selected block, always 32 bytes, zero if missing |
+| `eth_getLogs` | Mined logs in an inclusive block range, filtered by address(es) and positional topics |
 
 Anything else returns `-32601 Method not found`.
 
 ## Contracts and simulation
 
-M0–M4 are implemented. A legacy transaction with no `to` deploys its initcode;
+M0–M5 are implemented. A legacy transaction with no `to` deploys its initcode;
 contract calls carry calldata. Receipts report `contractAddress`, logs and actual
 gas. Reverts and out-of-gas executions are mined with `status: "0x0"`: the nonce
 advances and gas is charged, while the attempted contract changes roll back.
@@ -157,10 +156,15 @@ cargo test -p node --test contracts
 cargo test -p rpc --test json_rpc
 ```
 
-M5's `eth_getCode`, `eth_getStorageAt`, `eth_getLogs` and recommended `eth_gasPrice`
-remain pending. M6's final block-packing checks, storage-root commitments and real
-log blooms also remain pending. The Solidity demo and final write-up are still
-required by [FINAL-PROJECT.md](./FINAL-PROJECT.md).
+`eth_getLogs` defaults both range bounds to `latest`. Addresses and alternatives
+within a topic position are ORed; different positions are ANDed, and `null`
+matches any topic at that position. Empty alternative arrays are wildcards.
+`blockHash` selects one block and cannot be combined with range bounds. Future
+or reversed ranges are errors. Results retain block/transaction/log order.
+These semantics follow the [Ethereum JSON-RPC specification](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getlogs).
+
+M6's final block-packing checks, storage-root commitments and real log blooms,
+plus the Solidity demo, remain required by [FINAL-PROJECT.md](./FINAL-PROJECT.md).
 
 ## Chain parameters
 
