@@ -138,6 +138,7 @@ impl DatabaseCommit for BreejaDb {
                     entry.storage.insert(slot, value.present_value);
                 }
             }
+            entry.storage_root = primitives::node::storage_root_of(&entry.storage);
         }
     }
 }
@@ -242,6 +243,10 @@ mod tests {
         assert_eq!(stored.code, code);
         assert_eq!(stored.code_hash, keccak256(&code));
         assert_eq!(stored.storage[&U256::ZERO], U256::from(42));
+        assert_eq!(
+            stored.storage_root,
+            primitives::node::storage_root_of(&stored.storage)
+        );
         assert_eq!(
             db.code_by_hash(keccak256(&code)).unwrap().original_bytes(),
             code

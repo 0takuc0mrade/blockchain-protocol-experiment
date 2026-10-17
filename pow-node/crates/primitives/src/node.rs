@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::constants::{
     BLOCK_GAS_LIMIT, EXTRA_DATA, GAS_PRICE, MAX_DIFFICULTY_LEADING_ZEROS,
-    MIN_DIFFICULTY_LEADING_ZEROS, TRANSFER_GAS,
+    MIN_DIFFICULTY_LEADING_ZEROS,
 };
 
 /// An Ethereum account, including contract code and persistent storage.
@@ -326,9 +326,34 @@ pub fn state_root_of(accounts: &HashMap<Address, Account>) -> B256 {
     let mut buf = Vec::new();
     for (address, account) in entries {
         buf.extend_from_slice(address.as_slice());
-        account.encode(&mut buf);
+        // Derive both commitments from authoritative contents, never stale
+        // cached metadata. Raw code/storage remain outside the account RLP.
+        Account {
+            nonce: account.nonce,
+            balance: account.balance,
+            storage_root: storage_root_of(&account.storage),
+            code_hash: keccak256(&account.code),
+            ..Default::default()
+        }
+        .encode(&mut buf);
     }
     keccak256(buf)
+}
+
+/// Teaching storage commitment, not an Ethereum Merkle-Patricia trie root.
+/// Fixed-width key/value pairs are unambiguous; absent and zero slots agree.
+pub fn storage_root_of(storage: &HashMap<U256, U256>) -> B256 {
+    let mut entries: Vec<_> = storage
+        .iter()
+        .filter(|(_, value)| !value.is_zero())
+        .collect();
+    entries.sort_by_key(|(slot, _)| **slot);
+    let mut bytes = Vec::with_capacity(entries.len() * 64);
+    for (slot, value) in entries {
+        bytes.extend_from_slice(&slot.to_be_bytes::<32>());
+        bytes.extend_from_slice(&value.to_be_bytes::<32>());
+    }
+    keccak256(bytes)
 }
 
 /// Hashes an ordered list of hashes into a single root.
@@ -552,14 +577,13 @@ impl BlockState {
         self.mempool.iter().any(|tx| &tx.hash == hash)
     }
 
-    /// Oldest candidates for the next block, bounded by the minimum transaction
-    /// cost. Execution determines which candidates fit the remaining gas budget.
+    /// Candidates in arrival order. Execution determines which fit the remaining
+    /// gas budget; scanning past a large deferred candidate can find smaller ones.
     ///
     /// This does not remove them. The miner may spend a long time failing to seal
     /// a block, and a transaction must stay pending until it is actually mined.
     pub fn peek_mempool_batch(&self) -> Vec<PendingTransaction> {
-        let max_txs = (BLOCK_GAS_LIMIT / TRANSFER_GAS) as usize;
-        self.mempool.iter().take(max_txs).cloned().collect()
+        self.mempool.clone()
     }
 
     // block production
@@ -602,6 +626,7 @@ impl BlockState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::TRANSFER_GAS;
 
     #[test]
     fn leading_zero_bits_counts_what_it_says() {
@@ -685,6 +710,41 @@ mod tests {
         let mut three = one.clone();
         three.insert(a, Account::new(U256::from(99u64)));
         assert_ne!(state_root_of(&one), state_root_of(&three));
+    }
+
+    #[test]
+    fn state_roots_commit_to_actual_code_and_storage_even_with_stale_metadata() {
+        let address = Address::repeat_byte(0x11);
+        let initial = HashMap::from([(address, Account::new(U256::from(1)))]);
+        let mut changed = initial.clone();
+        // Deliberately bypass set_code and leave cached hashes unchanged.
+        changed.get_mut(&address).unwrap().code = Bytes::from_static(&[0x00]);
+        assert_ne!(state_root_of(&initial), state_root_of(&changed));
+        let code_root = state_root_of(&changed);
+        changed
+            .get_mut(&address)
+            .unwrap()
+            .storage
+            .insert(U256::ZERO, U256::from(42));
+        assert_ne!(code_root, state_root_of(&changed));
+        let storage_root = state_root_of(&changed);
+        changed
+            .get_mut(&address)
+            .unwrap()
+            .storage
+            .insert(U256::ZERO, U256::from(43));
+        assert_ne!(storage_root, state_root_of(&changed));
+    }
+
+    #[test]
+    fn storage_commitments_sort_full_width_slots_and_normalize_zero_values() {
+        let one = HashMap::from([(U256::ZERO, U256::from(42)), (U256::MAX, U256::from(7))]);
+        let mut two = HashMap::from([(U256::MAX, U256::from(7)), (U256::ZERO, U256::from(42))]);
+        two.insert(U256::from(123), U256::ZERO);
+        assert_eq!(storage_root_of(&one), storage_root_of(&two));
+        two.insert(U256::MAX, U256::from(8));
+        assert_ne!(storage_root_of(&one), storage_root_of(&two));
+        assert_eq!(storage_root_of(&HashMap::new()), keccak256([]));
     }
 
     #[test]

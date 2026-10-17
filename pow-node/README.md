@@ -132,7 +132,7 @@ Anything else returns `-32601 Method not found`.
 
 ## Contracts and simulation
 
-M0–M5 are implemented. A legacy transaction with no `to` deploys its initcode;
+M0–M6 are implemented. A legacy transaction with no `to` deploys its initcode;
 contract calls carry calldata. Receipts report `contractAddress`, logs and actual
 gas. Reverts and out-of-gas executions are mined with `status: "0x0"`: the nonce
 advances and gas is charged, while the attempted contract changes roll back.
@@ -163,8 +163,77 @@ matches any topic at that position. Empty alternative arrays are wildcards.
 or reversed ranges are errors. Results retain block/transaction/log order.
 These semantics follow the [Ethereum JSON-RPC specification](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getlogs).
 
-M6's final block-packing checks, storage-root commitments and real log blooms,
-plus the Solidity demo, remain required by [FINAL-PROJECT.md](./FINAL-PROJECT.md).
+Blocks accumulate actual gas usage. Each transaction's declared limit must fit
+the remaining budget before execution; transactions that cannot fit stay queued,
+and smaller later candidates can be included. Admission checks Shanghai intrinsic
+gas, including calldata and initcode. Receipt and block `logsBloom` values contain
+the real address/topic bits; reverted logs contribute nothing.
+
+State roots commit to nonce, balance, runtime code, and sorted non-zero storage
+slots. The storage commitment hashes concatenated 32-byte slot/value pairs;
+the account commitment retains four-field RLP. These are deterministic teaching
+commitments, without Ethereum trie proofs. The original PoW header structure is
+preserved; block bloom is derived from receipts for RPC. Block responses also
+provide the empty ommer hash/list and the parent-hash `mixHash` convention so
+standard clients can parse them.
+
+## Solidity demo
+
+With the node running, install Foundry (`forge` and `cast`) and `jq`, then run:
+
+```bash
+bash scripts/evm-demo.sh
+# For a different local port:
+RPC_URL=http://127.0.0.1:18545 bash scripts/evm-demo.sh
+```
+
+The script compiles [Counter.sol](./examples/evm-demo/src/Counter.sol) with Solidity
+0.8.24, optimization at 200 runs, and **Shanghai** as configured in
+[foundry.toml](./examples/evm-demo/foundry.toml). It checks the compiled fixtures,
+deploys the contract, sets and reads 42, checks slot zero and its event, and proves
+a simulated write leaves storage unchanged. It uses the public development key
+above and lets `cast send` fill gas price, gas limit and nonce. The script expects
+the development account to be funded. Forge downloads the pinned compiler if it
+is not installed.
+
+The compiled creation/runtime fixtures are checked in so the same Solidity
+contract is exercised by the ordinary offline Rust test suite. To regenerate
+them after intentionally changing the source or compiler settings:
+
+```bash
+forge build --root examples/evm-demo
+jq -r '.bytecode.object' examples/evm-demo/out/Counter.sol/Counter.json > examples/evm-demo/Counter.init.hex
+jq -r '.deployedBytecode.object' examples/evm-demo/out/Counter.sol/Counter.json > examples/evm-demo/Counter.runtime.hex
+```
+
+That RPC test deploys and calls the Solidity contract with exactly estimated
+gas, checks event topics/data, mines its reverting function, and checks that
+`eth_call` preserves state. Run all project checks with:
+
+```bash
+cargo test --workspace --locked --offline
+cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+cargo build --release --locked --offline
+```
+
+## Reading the implementation
+
+Use [FINAL-PROJECT.md](./FINAL-PROJECT.md) as the requirements and
+[EVM-NOTES.md](./EVM-NOTES.md) for the decisions and verification evidence.
+Read `primitives/src/node.rs` for state/snapshots/roots, `node/src/evm.rs` for the
+database adapter, `node/src/executor.rs` for execution/accounting, `node/src/pool.rs`
+and `miner.rs` for admission and mining, then `rpc/src/handlers.rs` for RPC behavior.
+These paths are under `crates/`. `primitives/src/params.rs` and `response.rs` define
+filter matching and wire formats. The corresponding unit tests plus
+`node/tests/contracts.rs`, `node/tests/mining.rs`, and `rpc/tests/json_rpc.rs`
+show the behaviors required by the brief.
+
+State is in memory: restarting loses contracts and blocks. Full historical
+snapshots, whole-pool cloning, recomputing storage commitments, and linear log
+scans suit small teaching chains. Transaction/receipt roots retain the starter's
+hash-list scheme (the receipt list commits only to transaction hashes), and
+block sizes remain estimates. There is no Ethereum consensus/header compatibility,
+disk persistence, state proof API, reorg handling, or pending execution overlay.
 
 ## Chain parameters
 

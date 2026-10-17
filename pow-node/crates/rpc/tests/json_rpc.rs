@@ -329,6 +329,217 @@ async fn gas_price_reports_the_chains_fixed_legacy_price() {
     assert_eq!(from_quantity(&price), primitives::constants::GAS_PRICE);
 }
 
+/// The checked-in bytecode is compiled from the adjacent Solidity project.
+/// scripts/evm-demo.sh recompiles and checks both fixtures before deploying.
+#[tokio::test]
+async fn compiled_solidity_counter_deploys_updates_emits_and_reverts_over_rpc() {
+    use alloy::primitives::keccak256;
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let mut harness = Harness::start(&[(alice, one_eth())], true).await;
+    let init: Bytes = include_str!("../../../examples/evm-demo/Counter.init.hex")
+        .trim()
+        .parse()
+        .unwrap();
+    let runtime = include_str!("../../../examples/evm-demo/Counter.runtime.hex").trim();
+    let gas: String = harness
+        .client
+        .request(
+            "eth_estimateGas",
+            rpc_params![serde_json::json!({"from": alice, "data": init})],
+        )
+        .await
+        .unwrap();
+    let deployment = harness
+        .submit(sign_deployment(DEV_PRIVATE_KEY, init, 0, from_quantity(&gas) as u64).unwrap())
+        .await;
+    assert_eq!(deployment["status"], "0x1");
+    let address: Address = deployment["contractAddress"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let code: String = harness
+        .client
+        .request("eth_getCode", rpc_params![address, "latest"])
+        .await
+        .unwrap();
+    assert_eq!(code, runtime);
+
+    let setter = |value: u64| {
+        let mut data = keccak256("set(uint256)")[..4].to_vec();
+        data.extend_from_slice(&U256::from(value).to_be_bytes::<32>());
+        Bytes::from(data)
+    };
+    let gas: String = harness
+        .client
+        .request(
+            "eth_estimateGas",
+            rpc_params![serde_json::json!({"from": alice, "to": address, "data": setter(42)})],
+        )
+        .await
+        .unwrap();
+    let receipt = harness
+        .submit(
+            sign_contract_call(
+                DEV_PRIVATE_KEY,
+                address,
+                U256::ZERO,
+                setter(42),
+                1,
+                from_quantity(&gas) as u64,
+            )
+            .unwrap(),
+        )
+        .await;
+    assert_eq!(receipt["status"], "0x1");
+    assert_eq!(receipt["logs"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        receipt["logs"][0]["topics"][0],
+        format!("{:#x}", keccak256("ValueChanged(address,uint256)"))
+    );
+    assert_eq!(
+        receipt["logs"][0]["topics"][1],
+        format!("0x{:0>64}", alloy::hex::encode(alice))
+    );
+    assert_eq!(receipt["logs"][0]["data"], format!("0x{:064x}", 42));
+    let failed = harness
+        .submit(
+            sign_contract_call(
+                DEV_PRIVATE_KEY,
+                address,
+                U256::ZERO,
+                Bytes::copy_from_slice(&keccak256("fail()")[..4]),
+                2,
+                100_000,
+            )
+            .unwrap(),
+        )
+        .await;
+    assert_eq!(failed["status"], "0x0");
+    assert_eq!(failed["logs"], serde_json::json!([]));
+    harness.stop_mining();
+
+    let stored: String = harness
+        .client
+        .request("eth_getStorageAt", rpc_params![address, "0x0", "latest"])
+        .await
+        .unwrap();
+    assert_eq!(stored, format!("0x{:064x}", 42));
+    let before = harness.chain.read().accounts_snapshot();
+    let output: String = harness
+        .client
+        .request(
+            "eth_call",
+            rpc_params![serde_json::json!({"from": alice, "to": address, "data": setter(7)})],
+        )
+        .await
+        .unwrap();
+    assert_eq!(output, "0x");
+    let output: String = harness.client.request("eth_call", rpc_params![serde_json::json!({"to": address, "data": Bytes::copy_from_slice(&keccak256("value()")[..4])})]).await.unwrap();
+    assert_eq!(output, stored);
+    assert_eq!(harness.chain.read().accounts_snapshot(), before);
+}
+
+#[tokio::test]
+async fn receipt_and_block_blooms_match_mined_logs_and_exclude_reverted_logs() {
+    use alloy::primitives::Bloom;
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let mut harness = Harness::start(&[(alice, one_eth())], false).await;
+    let good: Bytes = "0x602a60005260aa60206000a100".parse().unwrap();
+    let reverted: Bytes = "0x602a60005260bb60206000a160006000fd".parse().unwrap();
+    let addresses = [alice.create(0), alice.create(1), alice.create(2)];
+    let mut raw = Vec::new();
+    for (nonce, runtime) in [&good, &good, &reverted].into_iter().enumerate() {
+        raw.push(
+            sign_deployment(
+                DEV_PRIVATE_KEY,
+                initcode_for_runtime(runtime),
+                nonce as u64,
+                150_000,
+            )
+            .unwrap(),
+        );
+    }
+    for (index, address) in addresses.iter().enumerate() {
+        raw.push(
+            sign_contract_call(
+                DEV_PRIVATE_KEY,
+                *address,
+                U256::ZERO,
+                Bytes::new(),
+                3 + index as u64,
+                100_000,
+            )
+            .unwrap(),
+        );
+    }
+    let mut hashes = Vec::<String>::new();
+    for tx in raw {
+        hashes.push(
+            harness
+                .client
+                .request("eth_sendRawTransaction", rpc_params![tx])
+                .await
+                .unwrap(),
+        );
+    }
+    harness.miner = Some(miner::spawn(harness.chain.clone()));
+    harness
+        .wait_for("all bloom fixtures", |chain| {
+            chain
+                .read()
+                .get_receipt(&hashes[5].parse().unwrap())
+                .is_some()
+        })
+        .await;
+    harness.stop_mining();
+    let mut expected_block = Bloom::ZERO;
+    for (i, hash) in hashes.iter().enumerate() {
+        let receipt: Value = harness
+            .client
+            .request("eth_getTransactionReceipt", rpc_params![hash])
+            .await
+            .unwrap();
+        assert_eq!(receipt["blockNumber"], "0x1");
+        let mut expected_receipt = Bloom::ZERO;
+        if i == 3 || i == 4 {
+            let topic = B256::from(U256::from(0xaa).to_be_bytes::<32>());
+            expected_receipt.accrue_raw_log(addresses[i - 3], &[topic]);
+            expected_block |= expected_receipt;
+            assert_eq!(receipt["logs"][0]["logIndex"], format!("0x{:x}", i - 3));
+        } else {
+            assert_eq!(receipt["logs"], serde_json::json!([]));
+        }
+        assert_eq!(receipt["status"], if i == 5 { "0x0" } else { "0x1" });
+        assert_eq!(receipt["logsBloom"], format!("{expected_receipt:#x}"));
+    }
+    let block: Value = harness
+        .client
+        .request("eth_getBlockByNumber", rpc_params!["0x1", false])
+        .await
+        .unwrap();
+    assert_ne!(expected_block, Bloom::ZERO);
+    assert_eq!(block["logsBloom"], format!("{expected_block:#x}"));
+    // Standard clients parse the complete block while waiting for confirmations.
+    let parsed: alloy::rpc::types::Block = serde_json::from_value(block.clone()).unwrap();
+    assert_eq!(parsed.header.logs_bloom, expected_block);
+    let genesis: Value = harness
+        .client
+        .request("eth_getBlockByNumber", rpc_params!["earliest", false])
+        .await
+        .unwrap();
+    assert_eq!(genesis["logsBloom"], format!("{:#x}", Bloom::ZERO));
+    let logs: Vec<Value> = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![serde_json::json!({"fromBlock": "0x1", "toBlock": "0x1"})],
+        )
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 2);
+}
+
 #[tokio::test]
 async fn eth_chain_id_returns_the_configured_chain_id() {
     let harness = Harness::start(&[], false).await;

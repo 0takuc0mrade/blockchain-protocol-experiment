@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use alloy::primitives::{Address, B256, TxKind, U256};
 use primitives::{
-    constants::{BLOCK_REWARD, CHAIN_ID},
+    constants::{BLOCK_REWARD, CHAIN_ID, TRANSFER_GAS},
     node::{
         Account, Block, Log, PendingTransaction, Transaction, TransactionReceipt, hash_list_root,
     },
@@ -135,6 +135,9 @@ pub fn execute_block(mut db: BreejaDb, batch: &[PendingTransaction], block: &Blo
     let mut log_index = 0u64;
 
     for tx in batch {
+        if block.gas_limit.saturating_sub(gas_used) < TRANSFER_GAS {
+            break;
+        }
         // Reserve the transaction's declared limit before trying it. It stays
         // queued if it cannot fit; actual charged gas determines the next budget.
         if tx.gas > block.gas_limit.saturating_sub(gas_used) {
@@ -492,6 +495,27 @@ mod tests {
         assert_eq!(execution.transactions.len(), 1);
         assert_eq!(execution.receipts[0].status, 0);
         assert_eq!(execution.accounts[&DEV_ADDRESS].nonce, 1);
+    }
+
+    #[test]
+    fn packing_reuses_unused_allowance_and_preserves_deferred_sender_nonces() {
+        let miner = Address::repeat_byte(0x99);
+        let mut batch = Vec::new();
+        for nonce in 0..149 {
+            let mut tx = transfer(U256::ZERO, nonce);
+            tx.hash = B256::from(U256::from(nonce).to_be_bytes::<32>());
+            // The sum of declared limits exceeds a block many times over.
+            tx.gas = 100_000;
+            batch.push(tx);
+        }
+        let execution = execute_block(funded(one_eth()), &batch, &candidate(miner));
+        assert_eq!(execution.transactions.len(), 145);
+        assert_eq!(execution.gas_used, 145 * TRANSFER_GAS);
+        assert!(execution.gas_used <= BLOCK_GAS_LIMIT);
+        assert_eq!(execution.accounts[&DEV_ADDRESS].nonce, 145);
+        for (i, receipt) in execution.receipts.iter().enumerate() {
+            assert_eq!(receipt.cummulative_gas_used, (i as u64 + 1) * TRANSFER_GAS);
+        }
     }
 
     #[test]

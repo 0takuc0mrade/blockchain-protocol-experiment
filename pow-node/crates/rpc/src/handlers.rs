@@ -13,7 +13,7 @@ use primitives::{
     params::{BlockTag, CallRequest, LogFilter},
     response::{
         BlockResponse, LogResponse, TransactionReceiptResponse, TransactionResponse, data_bytes,
-        data_hash, quantity,
+        data_hash, logs_bloom, quantity,
     },
 };
 use serde_json::Value;
@@ -166,7 +166,14 @@ fn render_block(state: &BlockState, number: u64, full_transactions: bool) -> Val
             .collect()
     };
 
-    serde_json::to_value(BlockResponse::from_block(block, transactions))
+    let bloom = logs_bloom(
+        block
+            .transactions
+            .iter()
+            .filter_map(|hash| state.get_receipt(hash))
+            .flat_map(|receipt| &receipt.logs),
+    );
+    serde_json::to_value(BlockResponse::from_block(block, transactions, bloom))
         .expect("a block response always serializes")
 }
 
