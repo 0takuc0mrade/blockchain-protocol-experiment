@@ -6,11 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::constants::{
     BLOCK_GAS_LIMIT, EXTRA_DATA, GAS_PRICE, MAX_DIFFICULTY_LEADING_ZEROS,
-    MIN_DIFFICULTY_LEADING_ZEROS, TRANSFER_GAS,
+    MIN_DIFFICULTY_LEADING_ZEROS,
 };
 
-/// An externally owned account: Ethereum's account record, minus everything a
-/// contract would need.
+/// An Ethereum account, including contract code and persistent storage.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, RlpEncodable)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
@@ -18,6 +17,16 @@ pub struct Account {
     pub balance: U256,
     pub storage_root: B256,
     pub code_hash: B256,
+    /// Immutable runtime bytes. Cloning a snapshot shares this allocation.
+    /// The four-field account RLP commits to code through `code_hash`.
+    #[rlp(skip)]
+    #[serde(default)]
+    pub code: Bytes,
+    /// Missing slots read as zero. Snapshot clones copy this map independently.
+    /// Storage belongs behind `storage_root`, outside the account RLP itself.
+    #[rlp(skip)]
+    #[serde(default)]
+    pub storage: HashMap<U256, U256>,
 }
 
 /// A sealed block.
@@ -75,8 +84,7 @@ pub struct BlockHeader {
 
 /// A transaction that has been included in a block.
 ///
-/// `input` is always empty: Breeja rejects anything with calldata, because it
-/// has no EVM to run it with.
+/// A missing destination denotes contract creation; `input` holds calldata or initcode.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Transaction {
@@ -86,7 +94,7 @@ pub struct Transaction {
     pub transaction_index: u64,
     pub chain_id: u64,
     pub from: Address,
-    pub to: Address,
+    pub to: Option<Address>,
     pub value: U256,
     pub nonce: u64,
     pub gas: u64,
@@ -95,6 +103,20 @@ pub struct Transaction {
     pub v: u64,
     pub r: U256,
     pub s: U256,
+}
+
+/// A log emitted during successful execution, with its position in the sealed block.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Log {
+    pub address: Address,
+    pub topics: Vec<B256>,
+    pub data: Bytes,
+    pub block_hash: B256,
+    pub block_number: u64,
+    pub transaction_hash: B256,
+    pub transaction_index: u64,
+    pub log_index: u64,
 }
 
 /// The receipt proving what a transaction did.
@@ -106,12 +128,13 @@ pub struct TransactionReceipt {
     pub block_hash: B256,
     pub block_number: u64,
     pub from: Address,
-    pub to: Address,
+    pub to: Option<Address>,
+    pub contract_address: Option<Address>,
+    pub logs: Vec<Log>,
     pub gas_used: u64,
     pub cummulative_gas_used: u64,
     pub effective_gas_price: u128,
-    /// `1` for success. Breeja only ever includes transactions it has already
-    /// validated, so a receipt is never a failure.
+    /// `1` for successful EVM execution; `0` for a revert or halt.
     pub status: u8,
 }
 
@@ -120,7 +143,8 @@ pub struct TransactionReceipt {
 pub struct PendingTransaction {
     pub hash: B256,
     pub from: Address,
-    pub to: Address,
+    pub to: Option<Address>,
+    pub input: Bytes,
     pub value: U256,
     pub nonce: u64,
     pub gas: u64,
@@ -166,6 +190,12 @@ impl Account {
             balance,
             ..Default::default()
         }
+    }
+
+    /// Installs runtime code and its commitment together.
+    pub fn set_code(&mut self, code: Bytes) {
+        self.code_hash = keccak256(&code);
+        self.code = code;
     }
 
     /// Consumes this account's current nonce and advances it, the way sending a
@@ -296,9 +326,34 @@ pub fn state_root_of(accounts: &HashMap<Address, Account>) -> B256 {
     let mut buf = Vec::new();
     for (address, account) in entries {
         buf.extend_from_slice(address.as_slice());
-        account.encode(&mut buf);
+        // Derive both commitments from authoritative contents, never stale
+        // cached metadata. Raw code/storage remain outside the account RLP.
+        Account {
+            nonce: account.nonce,
+            balance: account.balance,
+            storage_root: storage_root_of(&account.storage),
+            code_hash: keccak256(&account.code),
+            ..Default::default()
+        }
+        .encode(&mut buf);
     }
     keccak256(buf)
+}
+
+/// Teaching storage commitment, not an Ethereum Merkle-Patricia trie root.
+/// Fixed-width key/value pairs are unambiguous; absent and zero slots agree.
+pub fn storage_root_of(storage: &HashMap<U256, U256>) -> B256 {
+    let mut entries: Vec<_> = storage
+        .iter()
+        .filter(|(_, value)| !value.is_zero())
+        .collect();
+    entries.sort_by_key(|(slot, _)| **slot);
+    let mut bytes = Vec::with_capacity(entries.len() * 64);
+    for (slot, value) in entries {
+        bytes.extend_from_slice(&slot.to_be_bytes::<32>());
+        bytes.extend_from_slice(&value.to_be_bytes::<32>());
+    }
+    keccak256(bytes)
 }
 
 /// Hashes an ordered list of hashes into a single root.
@@ -401,7 +456,7 @@ impl BlockState {
         self.receipts.get(hash)
     }
 
-    // account queries 
+    // account queries
 
     /// Account at the chain head. An address nobody has ever funded reads as an
     /// empty account rather than an error, exactly as on Ethereum.
@@ -415,6 +470,42 @@ impl BlockState {
         self.state_history
             .get(number as usize)
             .map(|snapshot| snapshot.get(address).cloned().unwrap_or_default())
+    }
+
+    /// Runtime bytecode at the chain head, empty for an address without code.
+    pub fn get_code(&self, address: &Address) -> Bytes {
+        self.accounts
+            .get(address)
+            .map(|account| account.code.clone())
+            .unwrap_or_default()
+    }
+
+    /// Runtime bytecode after a historical block, or `None` for an unknown block.
+    pub fn get_code_at(&self, address: &Address, number: u64) -> Option<Bytes> {
+        self.state_history.get(number as usize).map(|snapshot| {
+            snapshot
+                .get(address)
+                .map(|account| account.code.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    /// A storage slot at the chain head, zero if the address or slot is absent.
+    pub fn get_storage(&self, address: &Address, slot: U256) -> U256 {
+        self.accounts
+            .get(address)
+            .and_then(|account| account.storage.get(&slot).copied())
+            .unwrap_or_default()
+    }
+
+    /// A storage slot after a historical block, or `None` for an unknown block.
+    pub fn get_storage_at(&self, address: &Address, slot: U256, number: u64) -> Option<U256> {
+        self.state_history.get(number as usize).map(|snapshot| {
+            snapshot
+                .get(address)
+                .and_then(|account| account.storage.get(&slot).copied())
+                .unwrap_or_default()
+        })
     }
 
     /// The nonce the sender's *next* transaction must carry: the mined nonce plus
@@ -449,6 +540,27 @@ impl BlockState {
         self.accounts.clone()
     }
 
+    /// A copy of the state after a selected block for historical RPC execution.
+    pub fn accounts_snapshot_at(&self, number: u64) -> Option<HashMap<Address, Account>> {
+        self.state_history.get(number as usize).cloned()
+    }
+
+    /// The previous 256 blocks available to the next candidate's BLOCKHASH opcode.
+    pub fn block_hashes_snapshot(&self) -> HashMap<u64, B256> {
+        self.block_hashes_before(self.blocks.len() as u64)
+    }
+
+    /// The 256 ancestors visible to execution at `number`, excluding that block.
+    pub fn block_hashes_before(&self, number: u64) -> HashMap<u64, B256> {
+        self.blocks
+            .iter()
+            .rev()
+            .filter(|block| block.number < number)
+            .take(256)
+            .map(|block| (block.number, block.hash))
+            .collect()
+    }
+
     // mempool
 
     pub fn add_to_mempool(&mut self, tx: PendingTransaction) {
@@ -465,14 +577,13 @@ impl BlockState {
         self.mempool.iter().any(|tx| &tx.hash == hash)
     }
 
-    /// The transactions the next block would include: as many as fit in one
-    /// block's gas limit, oldest first.
+    /// Candidates in arrival order. Execution determines which fit the remaining
+    /// gas budget; scanning past a large deferred candidate can find smaller ones.
     ///
     /// This does not remove them. The miner may spend a long time failing to seal
     /// a block, and a transaction must stay pending until it is actually mined.
     pub fn peek_mempool_batch(&self) -> Vec<PendingTransaction> {
-        let max_txs = (BLOCK_GAS_LIMIT / TRANSFER_GAS) as usize;
-        self.mempool.iter().take(max_txs).cloned().collect()
+        self.mempool.clone()
     }
 
     // block production
@@ -515,6 +626,7 @@ impl BlockState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::TRANSFER_GAS;
 
     #[test]
     fn leading_zero_bits_counts_what_it_says() {
@@ -601,6 +713,135 @@ mod tests {
     }
 
     #[test]
+    fn state_roots_commit_to_actual_code_and_storage_even_with_stale_metadata() {
+        let address = Address::repeat_byte(0x11);
+        let initial = HashMap::from([(address, Account::new(U256::from(1)))]);
+        let mut changed = initial.clone();
+        // Deliberately bypass set_code and leave cached hashes unchanged.
+        changed.get_mut(&address).unwrap().code = Bytes::from_static(&[0x00]);
+        assert_ne!(state_root_of(&initial), state_root_of(&changed));
+        let code_root = state_root_of(&changed);
+        changed
+            .get_mut(&address)
+            .unwrap()
+            .storage
+            .insert(U256::ZERO, U256::from(42));
+        assert_ne!(code_root, state_root_of(&changed));
+        let storage_root = state_root_of(&changed);
+        changed
+            .get_mut(&address)
+            .unwrap()
+            .storage
+            .insert(U256::ZERO, U256::from(43));
+        assert_ne!(storage_root, state_root_of(&changed));
+    }
+
+    #[test]
+    fn storage_commitments_sort_full_width_slots_and_normalize_zero_values() {
+        let one = HashMap::from([(U256::ZERO, U256::from(42)), (U256::MAX, U256::from(7))]);
+        let mut two = HashMap::from([(U256::MAX, U256::from(7)), (U256::ZERO, U256::from(42))]);
+        two.insert(U256::from(123), U256::ZERO);
+        assert_eq!(storage_root_of(&one), storage_root_of(&two));
+        two.insert(U256::MAX, U256::from(8));
+        assert_ne!(storage_root_of(&one), storage_root_of(&two));
+        assert_eq!(storage_root_of(&HashMap::new()), keccak256([]));
+    }
+
+    #[test]
+    fn missing_code_and_storage_are_empty_but_unknown_blocks_are_missing() {
+        let state = BlockState::new_with_gensis(BreejaGenesis::default(), 8);
+        let address = Address::repeat_byte(0x11);
+
+        assert!(state.get_code(&address).is_empty());
+        assert_eq!(state.get_storage(&address, U256::ZERO), U256::ZERO);
+        assert_eq!(state.get_code_at(&address, 0), Some(Bytes::new()));
+        assert_eq!(
+            state.get_storage_at(&address, U256::ZERO, 0),
+            Some(U256::ZERO)
+        );
+        assert_eq!(state.get_code_at(&address, 1), None);
+        assert_eq!(state.get_storage_at(&address, U256::ZERO, 1), None);
+    }
+
+    #[test]
+    fn contract_snapshots_preserve_historical_code_and_storage() {
+        let address = Address::repeat_byte(0x11);
+        let code = Bytes::from_static(&[0x60, 0x2a, 0x00]);
+        let mut state = BlockState::new_with_gensis(BreejaGenesis::default(), 8);
+        let mut account = Account::default();
+        account.set_code(code.clone());
+        account.storage.insert(U256::ZERO, U256::from(42));
+
+        // These synthetic blocks exercise storage/history, not proof of work.
+        // The mining integration tests separately verify real block seals.
+        let mut block = state.head().clone();
+        block.number = 1;
+        block.parent_hash = state.head().hash;
+        block.hash = B256::repeat_byte(0x01);
+        let accounts = HashMap::from([(address, account)]);
+        block.state_root = state_root_of(&accounts);
+        state.commit_block(accounts, block, Vec::new(), Vec::new());
+
+        assert_eq!(state.get_code(&address), code);
+        assert_eq!(state.get_storage(&address, U256::ZERO), U256::from(42));
+        assert!(state.get_code_at(&address, 0).unwrap().is_empty());
+        assert_eq!(
+            state.get_storage_at(&address, U256::ZERO, 0),
+            Some(U256::ZERO)
+        );
+
+        let mut snapshot = state.accounts_snapshot();
+        snapshot
+            .get_mut(&address)
+            .unwrap()
+            .storage
+            .insert(U256::ZERO, U256::from(84));
+        assert_eq!(state.get_storage(&address, U256::ZERO), U256::from(42));
+
+        let mut block = state.head().clone();
+        block.number = 2;
+        block.parent_hash = state.head().hash;
+        block.hash = B256::repeat_byte(0x02);
+        block.state_root = state_root_of(&snapshot);
+        state.commit_block(snapshot, block, Vec::new(), Vec::new());
+
+        assert_eq!(state.get_storage(&address, U256::ZERO), U256::from(84));
+        assert_eq!(
+            state.get_storage_at(&address, U256::ZERO, 1),
+            Some(U256::from(42))
+        );
+        assert_eq!(
+            state.get_storage_at(&address, U256::ZERO, 2),
+            Some(U256::from(84))
+        );
+        assert_eq!(state.get_code_at(&address, 1), Some(code.clone()));
+        assert_eq!(state.get_code_at(&address, 2), Some(code));
+    }
+
+    #[test]
+    fn historical_blockhash_snapshots_include_exactly_the_visible_ancestors() {
+        let mut state = BlockState::new_with_gensis(BreejaGenesis::default(), 8);
+        let genesis = state.head().hash;
+        // Synthetic blocks isolate the 256-block lookup boundary from PoW.
+        for number in 1..=257u64 {
+            let mut block = state.head().clone();
+            block.number = number;
+            block.parent_hash = state.head().hash;
+            block.hash = B256::from(U256::from(number));
+            state.commit_block(state.accounts_snapshot(), block, Vec::new(), Vec::new());
+        }
+        let hashes = state.block_hashes_before(257);
+        assert_eq!(hashes.len(), 256);
+        assert!(!hashes.contains_key(&0));
+        assert!(!hashes.contains_key(&257));
+        assert_eq!(hashes.get(&1), Some(&B256::from(U256::from(1))));
+        assert_eq!(hashes.get(&256), Some(&B256::from(U256::from(256))));
+        assert_eq!(state.block_hashes_before(1), HashMap::from([(0, genesis)]));
+        assert!(state.block_hashes_before(0).is_empty());
+        assert!(state.block_hashes_snapshot().contains_key(&257));
+    }
+
+    #[test]
     fn pending_nonce_and_balance_account_for_what_is_already_queued() {
         let sender = Address::repeat_byte(0x11);
         let one_eth = U256::from(10u64).pow(U256::from(18));
@@ -614,7 +855,9 @@ mod tests {
         state.add_to_mempool(PendingTransaction {
             hash: B256::repeat_byte(0xaa),
             from: sender,
-            to: Address::repeat_byte(0x22),
+            // Destinations are optional because contract creation has no `to`.
+            to: Some(Address::repeat_byte(0x22)),
+            input: Bytes::new(),
             value: one_eth,
             nonce: 0,
             gas: TRANSFER_GAS,

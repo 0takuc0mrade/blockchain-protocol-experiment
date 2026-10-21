@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
 /// Which block a state query refers to.
@@ -71,6 +71,7 @@ impl<'de> Deserialize<'de> for BlockTag {
 pub struct CallRequest {
     pub from: Option<Address>,
     pub to: Option<Address>,
+    pub nonce: Option<U256>,
     pub gas: Option<U256>,
     pub gas_price: Option<U256>,
     pub value: Option<U256>,
@@ -80,19 +81,60 @@ pub struct CallRequest {
 
 impl CallRequest {
     /// The calldata this request carries, under whichever name it was sent.
-    ///
-    /// Breeja uses this to decide whether it can answer at all: calldata means
-    /// contract code, and there is no EVM to run it.
-    pub fn calldata(&self) -> Bytes {
-        self.data
+    pub fn calldata(&self) -> Result<Bytes, anyhow::Error> {
+        if let (Some(data), Some(input)) = (&self.data, &self.input)
+            && data != input
+        {
+            anyhow::bail!("data and input must agree when both are supplied");
+        }
+        Ok(self
+            .data
             .clone()
             .or_else(|| self.input.clone())
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
+}
 
-    /// Whether this request needs an EVM to answer.
-    pub fn needs_evm(&self) -> bool {
-        !self.calldata().is_empty() || self.to.is_none()
+/// Address/topic alternatives are ORed; separate topic positions are ANDed.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T: PartialEq> OneOrMany<T> {
+    pub fn matches(&self, value: &T) -> bool {
+        match self {
+            Self::One(expected) => expected == value,
+            // Like an omitted filter, an empty alternatives list is a wildcard.
+            Self::Many(values) => values.is_empty() || values.contains(value),
+        }
+    }
+}
+
+/// A mined-log query. A block hash selects one block instead of a range.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogFilter {
+    pub from_block: Option<BlockTag>,
+    pub to_block: Option<BlockTag>,
+    pub block_hash: Option<B256>,
+    pub address: Option<OneOrMany<Address>>,
+    pub topics: Option<Vec<Option<OneOrMany<B256>>>>,
+}
+
+impl LogFilter {
+    pub fn matches(&self, log: &crate::node::Log) -> bool {
+        self.address
+            .as_ref()
+            .is_none_or(|addresses| addresses.matches(&log.address))
+            && self.topics.as_ref().is_none_or(|topics| {
+                topics.len() <= log.topics.len()
+                    && topics.iter().zip(&log.topics).all(|(filter, topic)| {
+                        filter.as_ref().is_none_or(|values| values.matches(topic))
+                    })
+            })
     }
 }
 
@@ -123,22 +165,19 @@ mod tests {
     }
 
     #[test]
-    fn a_call_needs_an_evm_when_it_carries_calldata_or_creates_a_contract() {
-        let transfer = CallRequest {
-            to: Some(Address::ZERO),
+    fn calldata_aliases_agree_and_conflicting_values_are_rejected() {
+        // The old needs_evm test assumed empty calldata never executes code.
+        // Contracts can run with empty calldata, so all calls now use the VM.
+        let bytes = Bytes::from_static(&[0xde, 0xad]);
+        assert_eq!(CallRequest::default().calldata().unwrap(), Bytes::new());
+        let mut request = CallRequest {
+            input: Some(bytes.clone()),
             ..Default::default()
         };
-        assert!(!transfer.needs_evm());
-
-        let contract_call = CallRequest {
-            to: Some(Address::ZERO),
-            data: Some(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])),
-            ..Default::default()
-        };
-        assert!(contract_call.needs_evm());
-
-        // No `to` at all is a contract deployment.
-        let deployment = CallRequest::default();
-        assert!(deployment.needs_evm());
+        assert_eq!(request.calldata().unwrap(), bytes);
+        request.data = Some(bytes.clone());
+        assert_eq!(request.calldata().unwrap(), bytes);
+        request.input = Some(Bytes::new());
+        assert!(request.calldata().is_err());
     }
 }

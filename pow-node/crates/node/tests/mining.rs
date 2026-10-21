@@ -6,11 +6,12 @@ use alloy::primitives::{Address, B256, U256};
 use node::{
     Chain, ChainConfig, miner,
     testing::{
-        DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, address_of, one_eth, sign_transfer, sign_transfer_with,
+        DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, address_of, one_eth, sign_deployment, sign_transfer,
+        sign_transfer_with,
     },
 };
 use primitives::{
-    constants::{GAS_PRICE, TRANSFER_GAS},
+    constants::{BLOCK_GAS_LIMIT, GAS_PRICE, TRANSFER_GAS},
     node::BreejaGenesis,
 };
 
@@ -28,6 +29,71 @@ fn test_chain(funded: &[(Address, U256)]) -> Chain {
         },
         config,
     )
+}
+
+#[test]
+fn mixed_gas_blocks_defer_large_transactions_and_scan_beyond_149_candidates() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let bob = address_of(DEV_PRIVATE_KEY_1).unwrap();
+    let chain = test_chain(&[(alice, one_eth()), (bob, one_eth())]);
+    // Failed creation burns 2M gas. Each later Alice transaction declares the
+    // whole block limit and must wait; Bob's smaller transfer can still fit.
+    let burn = chain
+        .submit_raw_transaction(
+            &sign_deployment(DEV_PRIVATE_KEY, "0x5b600056".parse().unwrap(), 0, 2_000_000).unwrap(),
+        )
+        .unwrap();
+    let mut deferred = Vec::new();
+    for nonce in 1..149 {
+        deferred.push(
+            chain
+                .submit_raw_transaction(
+                    &sign_transfer_with(
+                        DEV_PRIVATE_KEY,
+                        bob,
+                        U256::ZERO,
+                        nonce,
+                        GAS_PRICE,
+                        BLOCK_GAS_LIMIT,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+        );
+    }
+    let small = chain
+        .submit_raw_transaction(&sign_transfer(DEV_PRIVATE_KEY_1, alice, U256::ZERO, 0).unwrap())
+        .unwrap();
+    assert_eq!(chain.read().mempool_len(), 150);
+    let handle = miner::spawn(chain.clone());
+    wait_for(Duration::from_secs(10), "mixed-gas block", || {
+        chain.read().get_receipt(&small).is_some()
+    });
+    chain.shutdown();
+    handle.join().unwrap();
+
+    let state = chain.read();
+    let first = state.get_block(1).unwrap();
+    assert_eq!(first.transactions, vec![burn, small]);
+    assert_eq!(first.gas_used, 2_000_000 + TRANSFER_GAS);
+    assert_eq!(state.get_receipt(&burn).unwrap().status, 0);
+    for hash in deferred {
+        assert!(!first.transactions.contains(&hash));
+    }
+    for number in 1..=state.get_block_number() {
+        let block = state.get_block(number).unwrap();
+        assert!(block.gas_used <= BLOCK_GAS_LIMIT);
+        let mut used = 0;
+        for hash in &block.transactions {
+            let tx = state.get_transaction(hash).unwrap();
+            assert!(tx.gas <= BLOCK_GAS_LIMIT - used);
+            let receipt = state.get_receipt(hash).unwrap();
+            used += receipt.gas_used;
+            assert_eq!(receipt.cummulative_gas_used, used);
+        }
+        assert_eq!(used, block.gas_used);
+        node::pow::verify(&block.header(), &block.hash, block.difficulty).unwrap();
+    }
 }
 
 /// Blocks until `predicate` holds, or fails the test after `timeout`.
@@ -84,7 +150,8 @@ fn a_signed_transfer_is_mined_and_moves_the_eth() {
     assert_eq!(state.mempool_len(), 0);
     let tx = state.get_transaction(&tx_hash).unwrap();
     assert_eq!(tx.from, alice);
-    assert_eq!(tx.to, bob);
+    // Creation has no destination; a transfer still reports the same recipient.
+    assert_eq!(tx.to, Some(bob));
     assert_eq!(tx.value, one_eth() * U256::from(5u64));
 
     // The block it landed in lists it.

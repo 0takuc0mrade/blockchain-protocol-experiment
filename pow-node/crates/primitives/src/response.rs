@@ -1,11 +1,11 @@
 use std::fmt::LowerHex;
 
-use alloy::primitives::{Address, B256, Bytes};
+use alloy::primitives::{Address, B256, Bloom, Bytes, keccak256};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     constants::{EXTRA_DATA, TRANSFER_GAS},
-    node::{Block, Transaction, TransactionReceipt},
+    node::{Block, Log, Transaction, TransactionReceipt},
 };
 
 /// Encodes a number as an Ethereum *quantity*: minimal hex, `0x0` for zero.
@@ -37,6 +37,24 @@ pub fn data_bytes(bytes: &Bytes) -> String {
     format!("0x{}", alloy::hex::encode(bytes))
 }
 
+/// Ethereum's 2048-bit bloom: three Keccak-derived bits per address/topic.
+/// Log data is deliberately excluded. This is a membership hint, not a proof.
+pub fn logs_bloom<'a>(logs: impl IntoIterator<Item = &'a Log>) -> Bloom {
+    let mut bloom = Bloom::ZERO;
+    for log in logs {
+        for bytes in std::iter::once(log.address.as_slice())
+            .chain(log.topics.iter().map(|topic| topic.as_slice()))
+        {
+            let hash = keccak256(bytes);
+            for offset in [0, 2, 4] {
+                let bit = (usize::from(hash[offset]) << 8 | usize::from(hash[offset + 1])) & 2047;
+                bloom[255 - bit / 8] |= 1 << (bit % 8);
+            }
+        }
+    }
+    bloom
+}
+
 /// A block, as `eth_getBlockByNumber` and `eth_getBlockByHash` return it.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +62,9 @@ pub struct BlockResponse {
     pub number: String,
     pub hash: String,
     pub parent_hash: String,
+    pub sha3_uncles: String,
+    pub uncles: Vec<String>,
+    pub mix_hash: String,
     pub state_root: String,
     #[serde(rename = "transactionsRoot")]
     pub transaction_root: String,
@@ -53,6 +74,7 @@ pub struct BlockResponse {
     pub timestamp: String,
     pub gas_limit: String,
     pub gas_used: String,
+    pub logs_bloom: String,
     pub miner: String,
     pub extra_data: String,
     pub nonce: String,
@@ -72,7 +94,7 @@ pub struct TransactionResponse {
     pub transaction_index: String,
     pub chain_id: String,
     pub from: String,
-    pub to: String,
+    pub to: Option<String>,
     pub value: String,
     pub nonce: String,
     pub gas: String,
@@ -95,19 +117,48 @@ pub struct TransactionReceiptResponse {
     pub block_hash: String,
     pub block_number: String,
     pub from: String,
-    pub to: String,
+    pub to: Option<String>,
     pub gas_used: String,
+    #[serde(rename = "cumulativeGasUsed")]
     pub cummulative_gas_used: String,
     pub effective_gas_price: String,
-    /// Always `null`: deploying a contract needs an EVM, so Breeja rejects it.
     pub contract_address: Option<String>,
-    /// Always empty: logs are emitted by the `LOG*` opcodes, and there is no EVM
-    /// to execute them.
-    pub logs: Vec<serde_json::Value>,
+    pub logs: Vec<LogResponse>,
     pub logs_bloom: String,
     pub status: String,
     #[serde(rename = "type")]
     pub tx_type: String,
+}
+
+/// Ethereum's JSON-RPC form of one mined log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogResponse {
+    pub address: String,
+    pub topics: Vec<String>,
+    pub data: String,
+    pub block_hash: String,
+    pub block_number: String,
+    pub transaction_hash: String,
+    pub transaction_index: String,
+    pub log_index: String,
+    pub removed: bool,
+}
+
+impl From<&Log> for LogResponse {
+    fn from(log: &Log) -> Self {
+        Self {
+            address: data_address(&log.address),
+            topics: log.topics.iter().map(data_hash).collect(),
+            data: data_bytes(&log.data),
+            block_hash: data_hash(&log.block_hash),
+            block_number: quantity(log.block_number),
+            transaction_hash: data_hash(&log.transaction_hash),
+            transaction_index: quantity(log.transaction_index),
+            log_index: quantity(log.log_index),
+            removed: false,
+        }
+    }
 }
 
 impl BlockResponse {
@@ -115,11 +166,16 @@ impl BlockResponse {
     ///
     /// `transactions` is supplied by the caller because `eth_getBlockBy*` takes a
     /// flag choosing between bare hashes and full transaction objects.
-    pub fn from_block(block: &Block, transactions: Vec<serde_json::Value>) -> Self {
+    pub fn from_block(block: &Block, transactions: Vec<serde_json::Value>, bloom: Bloom) -> Self {
         Self {
             number: quantity(block.number),
             hash: data_hash(&block.hash),
             parent_hash: data_hash(&block.parent_hash),
+            // Breeja has no ommers. Its PREVRANDAO convention is parent_hash;
+            // these RPC compatibility fields do not change its teaching header.
+            sha3_uncles: data_hash(&keccak256([0xc0])),
+            uncles: Vec::new(),
+            mix_hash: data_hash(&block.parent_hash),
             state_root: data_hash(&block.state_root),
             transaction_root: data_hash(&block.transaction_root),
             receipts_root: data_hash(&block.receipts_root),
@@ -128,6 +184,7 @@ impl BlockResponse {
             timestamp: quantity(block.timestamp),
             gas_limit: quantity(block.gas_limit),
             gas_used: quantity(block.gas_used),
+            logs_bloom: format!("{bloom:#x}"),
             miner: data_address(&block.miner),
             extra_data: data_bytes(&block.extra_data),
             nonce: data_u64(block.nonce),
@@ -146,7 +203,7 @@ impl From<&Transaction> for TransactionResponse {
             transaction_index: quantity(tx.transaction_index),
             chain_id: quantity(tx.chain_id),
             from: data_address(&tx.from),
-            to: data_address(&tx.to),
+            to: tx.to.as_ref().map(data_address),
             value: quantity(tx.value),
             nonce: quantity(tx.nonce),
             gas: quantity(tx.gas),
@@ -168,14 +225,13 @@ impl From<&TransactionReceipt> for TransactionReceiptResponse {
             block_hash: data_hash(&receipt.block_hash),
             block_number: quantity(receipt.block_number),
             from: data_address(&receipt.from),
-            to: data_address(&receipt.to),
+            to: receipt.to.as_ref().map(data_address),
             gas_used: quantity(receipt.gas_used),
             cummulative_gas_used: quantity(receipt.cummulative_gas_used),
             effective_gas_price: quantity(receipt.effective_gas_price),
-            contract_address: None,
-            logs: Vec::new(),
-            // A bloom filter over no logs is 256 zero bytes.
-            logs_bloom: format!("0x{}", "00".repeat(256)),
+            contract_address: receipt.contract_address.as_ref().map(data_address),
+            logs: receipt.logs.iter().map(LogResponse::from).collect(),
+            logs_bloom: format!("{:#x}", logs_bloom(&receipt.logs)),
             status: quantity(receipt.status),
             tx_type: "0x0".to_owned(),
         }
@@ -193,8 +249,7 @@ fn block_size(block: &Block) -> u64 {
     HEADER_BYTES + EXTRA_DATA.len() as u64 + block.transactions.len() as u64 * TX_BYTES
 }
 
-/// Gas a plain transfer costs. Returned by `eth_estimateGas`, where it is the
-/// only answer a node without an EVM can give.
+/// Intrinsic gas baseline for an ordinary ETH transfer.
 pub const TRANSFER_GAS_ESTIMATE: u64 = TRANSFER_GAS;
 
 #[cfg(test)]
@@ -207,6 +262,28 @@ mod tests {
         assert_eq!(quantity(1u64), "0x1");
         assert_eq!(quantity(31u64), "0x1f");
         assert_eq!(quantity(21_000u64), "0x5208");
+    }
+
+    #[test]
+    fn bloom_matches_ethereum_address_and_topic_bits_and_excludes_data() {
+        let log = Log {
+            address: Address::repeat_byte(0x11),
+            topics: vec![B256::repeat_byte(0xaa), B256::repeat_byte(0xbb)],
+            data: Bytes::from_static(&[0xff; 32]),
+            ..Default::default()
+        };
+        let bloom = logs_bloom([&log]);
+        let mut reference = Bloom::ZERO;
+        reference.accrue_raw_log(log.address, &log.topics);
+        assert_eq!(bloom, reference);
+        assert_ne!(bloom, Bloom::ZERO);
+        let different_data = Log {
+            data: Bytes::new(),
+            ..log.clone()
+        };
+        assert_eq!(bloom, logs_bloom([&different_data]));
+        assert_eq!(bloom, logs_bloom([&log, &log]));
+        assert_eq!(logs_bloom([]), Bloom::ZERO);
     }
 
     #[test]
