@@ -183,7 +183,7 @@ I retained existing coverage and commented on changed no-EVM expectations:
 | M3 | 75 | `30586ef` |
 | M4 | 85 | `7eea765` |
 | M5 | 88 | `d7f8dbf` |
-| M6 | 95 | M6 commit |
+| M6 | 95 | `8512698` |
 
 I passed the workspace tests, release build and Clippy with warnings denied:
 
@@ -196,5 +196,5 @@ log scans. I preserve the starter's hash-list transaction/receipt roots; the
 receipt list commits only to transaction hashes. I expose derived blooms rather
 than adding them to the hashed header, and block sizes remain estimates.
 I do not implement Ethereum consensus compatibility, trie proofs, persistence,
-reorgs or a pending execution overlay. I still need the submission pull request
-against my fork after reviewing this implementation.
+reorgs or a pending execution overlay. I prepared this work for submission as a
+pull request against my fork.
